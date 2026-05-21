@@ -9,6 +9,7 @@ technologies for the buildings, transport and industry sectors.
 import logging
 import os
 from itertools import product
+from pathlib import Path
 from types import SimpleNamespace
 
 import networkx as nx
@@ -713,7 +714,15 @@ def add_eu_bus(n, x=-5.5, y=46):
 
 
 def add_co2_tracking(
-    n, costs, options, sequestration_potential_file=None, co2_price: float = 0.0
+    n,
+    costs,
+    options,
+    sequestration_potential_file=None,
+    co2_price: float = 0.0,
+    cdr_credit_price: float = 0.0,
+    cdr_credit_scope: str | list[str] = "all_sequestration",
+    cdr_credit_timing: str = "capture",
+    cdr_credit_prices_by_scope: dict[str, float] | None = None,
 ):
     """
     Add CO2 tracking components to the network including atmospheric CO2,
@@ -733,6 +742,11 @@ def add_co2_tracking(
             - max_size: float
             - years_of_storage: float
         - co2_sequestration_cost: float
+        - co2_sequestration_cost_by_country: dict[str, float] (optional)
+        - co2_sequestration_cost_by_node: dict[str, float] (optional)
+        - co2_sequestration_discount_rate: float (optional, default 0.07)
+        - co2_sequestration_discount_rate_by_country: dict[str, float] (optional)
+        - co2_sequestration_discount_rate_by_node: dict[str, float] (optional)
         - co2_sequestration_lifetime: float
         - co2_vent: bool
     sequestration_potential_file : str, optional
@@ -815,6 +829,47 @@ def add_co2_tracking(
         p_nom_extendable=True,
     )
 
+    location_to_bus = pd.Series(sequestration_buses, index=spatial.co2.locations)
+
+    def apply_regional_overrides(
+        values: pd.Series,
+        *,
+        country_overrides: dict | None = None,
+        node_overrides: dict | None = None,
+        value_name: str = "value",
+    ) -> pd.Series:
+        """
+        Apply optional country and node overrides to location-based values.
+
+        Country keys are ISO2 codes inferred from the first two characters of
+        each location name (e.g. ES0 1 -> ES). Node keys can be either location
+        names (e.g. ES0 1) or sequestration bus names (e.g. ES0 1 co2 sequestered).
+        """
+        updated = values.copy()
+
+        if country_overrides:
+            country_series = pd.Series(country_overrides, dtype=float)
+            countries = pd.Index(spatial.co2.locations).str[:2]
+            mapped = pd.Series(countries.map(country_series).values, index=updated.index)
+            updated = updated.where(mapped.isna(), mapped)
+
+        if node_overrides:
+            for key, value in node_overrides.items():
+                key = str(key)
+                value = float(value)
+                if key in updated.index:
+                    updated.loc[key] = value
+                elif key in location_to_bus.index:
+                    updated.loc[location_to_bus.loc[key]] = value
+                else:
+                    logger.warning(
+                        "Ignoring unknown co2 sequestration %s override key '%s'.",
+                        value_name,
+                        key,
+                    )
+
+        return updated
+
     if options["regional_co2_sequestration_potential"]["enable"]:
         if sequestration_potential_file is None:
             raise ValueError(
@@ -839,17 +894,65 @@ def add_co2_tracking(
             .mul(1e6)
             / annualiser
         )  # t
-        e_nom_max = e_nom_max.rename(index=lambda x: x + " co2 sequestered")
+        # Map location-indexed sequestration potentials to the actual sequestration bus names.
+        # This keeps both spatial and non-spatial CO2 configurations aligned.
+        e_nom_max = e_nom_max.rename(index=location_to_bus.to_dict())
     else:
         e_nom_max = np.inf
+
+    sequestration_capital_cost = pd.Series(
+        float(options["co2_sequestration_cost"]),
+        index=sequestration_buses,
+        dtype=float,
+    )
+    sequestration_capital_cost = apply_regional_overrides(
+        sequestration_capital_cost,
+        country_overrides=options.get("co2_sequestration_cost_by_country"),
+        node_overrides=options.get("co2_sequestration_cost_by_node"),
+        value_name="cost",
+    )
+
+    sequestration_discount_rate = pd.Series(
+        float(options.get("co2_sequestration_discount_rate", 0.07)),
+        index=sequestration_buses,
+        dtype=float,
+    )
+    sequestration_discount_rate = apply_regional_overrides(
+        sequestration_discount_rate,
+        country_overrides=options.get("co2_sequestration_discount_rate_by_country"),
+        node_overrides=options.get("co2_sequestration_discount_rate_by_node"),
+        value_name="discount rate",
+    )
+
+    if (sequestration_discount_rate < 0).any():
+        invalid_nodes = sequestration_discount_rate[sequestration_discount_rate < 0]
+        raise ValueError(
+            "co2 sequestration discount rates must be non-negative. "
+            f"Invalid entries: {invalid_nodes.to_dict()}"
+        )
+
+    base_discount_rate = float(options.get("co2_sequestration_discount_rate", 0.07))
+    if base_discount_rate < 0:
+        raise ValueError(
+            "sector.co2_sequestration_discount_rate must be non-negative, "
+            f"got {base_discount_rate}."
+        )
+
+    # Treat the configured sequestration cost as referenced to the base discount rate
+    # and scale it regionally by the annuity-ratio of local/base rates.
+    annuity_base = calculate_annuity(options["co2_sequestration_lifetime"], base_discount_rate)
+    annuity_local = calculate_annuity(
+        options["co2_sequestration_lifetime"], sequestration_discount_rate
+    )
+    sequestration_capital_cost = sequestration_capital_cost * annuity_local / annuity_base
 
     n.add(
         "Store",
         sequestration_buses,
         e_nom_extendable=True,
         e_nom_max=e_nom_max,
-        capital_cost=options["co2_sequestration_cost"],
-        marginal_cost=-0.1,
+        capital_cost=sequestration_capital_cost,
+        marginal_cost=0.0,
         bus=sequestration_buses,
         lifetime=options["co2_sequestration_lifetime"],
         carrier="co2 sequestered",
@@ -930,6 +1033,7 @@ def add_co2_network(n, costs, co2_network_cost_factor=1.0):
         carrier="CO2 pipeline",
         lifetime=costs.at["CO2 pipeline", "lifetime"],
     )
+
 
 
 def add_allam_gas(
@@ -1213,35 +1317,263 @@ def add_methanol_reforming_cc(n, costs):
     )
 
 
-def add_dac(n, costs):
+def _load_dac_weather_factors(options):
+    """Load country-level DAC weather factors CSV, or return None if not configured."""
+    weather_cfg = options.get("dac_weather_factors", {})
+    if not weather_cfg.get("enable", False):
+        return None
+    path = Path(weather_cfg.get("file", "data/dac_country_weather_factors.csv"))
+    if not path.exists():
+        logger.warning(
+            "dac_weather_factors enabled but file not found: %s — skipping weather scaling", path
+        )
+        return None
+    return pd.read_csv(path, index_col="country")
+
+
+def _node_weather_factors(locations, weather_df, elec_col, heat_col):
+    """Return per-node (elec_factor, heat_factor) Series aligned to locations index.
+
+    Country code is the first two characters of the location name (e.g. 'DE0' → 'DE').
+    Missing countries fall back to 1.0 (no adjustment).
+    """
+    country_codes = locations.str[:2]
+    if weather_df is None:
+        ones = pd.Series(1.0, index=locations.index)
+        return ones, ones
+    elec_factors = country_codes.map(weather_df[elec_col]).fillna(1.0)
+    heat_factors = country_codes.map(weather_df[heat_col]).fillna(1.0) if heat_col else pd.Series(1.0, index=locations.index)
+    elec_factors.index = locations.index
+    heat_factors.index = locations.index
+    return elec_factors, heat_factors
+
+
+def add_dac(n, costs, options):
     heat_carriers = ["urban central heat", "services urban decentral heat"]
     heat_buses = n.buses.index[n.buses.carrier.isin(heat_carriers)]
     locations = n.buses.location[heat_buses]
 
-    electricity_input = (
-        costs.at["direct air capture", "electricity-input"]
-        + costs.at["direct air capture", "compression-electricity-input"]
-    )  # MWh_el / tCO2
-    heat_input = (
-        costs.at["direct air capture", "heat-input"]
-        - costs.at["direct air capture", "compression-heat-output"]
-    )  # MWh_th / tCO2
+    weather_df = _load_dac_weather_factors(options)
 
-    n.add(
-        "Link",
-        heat_buses.str.replace(" heat", " DAC"),
-        bus0=locations.values,
-        bus1=heat_buses,
-        bus2="co2 atmosphere",
-        bus3=spatial.co2.df.loc[locations, "nodes"].values,
-        carrier="DAC",
-        capital_cost=costs.at["direct air capture", "capital_cost"] / electricity_input,
-        efficiency=-heat_input / electricity_input,
-        efficiency2=-1 / electricity_input,
-        efficiency3=1 / electricity_input,
-        p_nom_extendable=True,
-        lifetime=costs.at["direct air capture", "lifetime"],
+    dac_variants = options.get("dac_variants", {})
+    use_variants = bool(dac_variants.get("enable", False))
+    variants = dac_variants.get("variants", {}) if use_variants else {}
+    if not variants:
+        variants = {"default": {"carrier_name": "DAC", "cost_technology": "direct air capture"}}
+
+    # Column names in dac_country_weather_factors.csv for each weather_type.
+    # weather_type is inferred from carrier_name if not explicitly set in config.
+    _WEATHER_COLS = {
+        "ldac": ("ldac_elec_factor", None),           # no separate heat panel for L-DAC
+        "sdac": ("sdac_elec_factor", "sdac_heat_factor"),
+    }
+
+    def _infer_weather_type(carrier: str, explicit: str | None) -> str | None:
+        if explicit is not None:
+            return explicit or None
+        c = carrier.lower()
+        if "liquid" in c:
+            return "ldac"
+        if "solid" in c:
+            return "sdac"
+        return None  # electrochemical, generic DAC, etc.
+
+    for variant_name, params in variants.items():
+        variant = params or {}
+        carrier_name = variant.get("carrier_name", f"DAC-{variant_name}")
+        cost_tech = variant.get("cost_technology", f"direct air capture - {variant_name}")
+        weather_type = _infer_weather_type(carrier_name, variant.get("weather_type"))
+        suffix = carrier_name if carrier_name.startswith("DAC") else f"DAC-{carrier_name}"
+
+        link_names = heat_buses.str.replace(" heat", f" {suffix}")
+
+        # Per-variant base costs read directly from the costs table
+        base_electricity_input = (
+            costs.at[cost_tech, "electricity-input"]
+            + costs.at[cost_tech, "compression-electricity-input"]
+        )  # MWh_el / tCO2
+        base_heat_input = costs.at[cost_tech, "heat-input"]
+        base_compression_heat_output = costs.at[cost_tech, "compression-heat-output"]
+        base_heat_output = costs.at[cost_tech, "heat-output"]
+
+        # Per-node weather scaling of electricity and heat inputs
+        if weather_type and weather_type in _WEATHER_COLS:
+            elec_col, heat_col = _WEATHER_COLS[weather_type]
+            node_elec_factors, node_heat_factors = _node_weather_factors(
+                locations, weather_df, elec_col, heat_col
+            )
+        else:
+            node_elec_factors = pd.Series(1.0, index=locations.index)
+            node_heat_factors = pd.Series(1.0, index=locations.index)
+
+        # Per-node energy demands (MWh / tCO2)
+        node_electricity_input = base_electricity_input * node_elec_factors
+        node_gross_heat_input = base_heat_input * node_heat_factors
+        node_net_heat_input = node_gross_heat_input - base_compression_heat_output - base_heat_output
+
+        if (node_electricity_input <= 0).any():
+            raise ValueError(
+                f"DAC variant '{variant_name}' has non-positive electricity input at some nodes."
+            )
+
+        node_capex = costs.at[cost_tech, "capital_cost"] / node_electricity_input
+
+        n.add(
+            "Link",
+            link_names,
+            bus0=locations.values,
+            bus1=heat_buses,
+            bus2="co2 atmosphere",
+            bus3=spatial.co2.df.loc[locations, "nodes"].values,
+            carrier=carrier_name,
+            capital_cost=node_capex.values,
+            efficiency=(-node_net_heat_input / node_electricity_input).values,
+            efficiency2=(-1.0 / node_electricity_input).values,
+            efficiency3=(1.0 / node_electricity_input).values,
+            p_nom_extendable=True,
+            lifetime=costs.at[cost_tech, "lifetime"],
+        )
+
+def _get_positive_co2_output_per_dispatch(n, link_name):
+    co2_stored_buses = set(
+        n.buses.index[n.buses.carrier.astype(str).str.startswith("co2 stored")]
     )
+    out = 0.0
+    for idx in [1, 2, 3, 4]:
+        bus_col = f"bus{idx}"
+        eff_col = f"efficiency{idx}" if idx > 1 else "efficiency"
+        if bus_col in n.links.columns and eff_col in n.links.columns:
+            bus = n.links.at[link_name, bus_col]
+            eff = n.links.at[link_name, eff_col]
+            if pd.notna(bus) and bus in co2_stored_buses and pd.notna(eff) and eff > 0:
+                out += float(eff)
+    return out
+
+
+def _get_co2_atmosphere_withdrawal_per_dispatch(n, link_name):
+    withdrawal = 0.0
+    for idx in [1, 2, 3, 4]:
+        bus_col = f"bus{idx}"
+        eff_col = f"efficiency{idx}" if idx > 1 else "efficiency"
+        if bus_col in n.links.columns and eff_col in n.links.columns:
+            bus = n.links.at[link_name, bus_col]
+            eff = n.links.at[link_name, eff_col]
+            if pd.notna(bus) and bus == "co2 atmosphere" and pd.notna(eff) and eff < 0:
+                withdrawal += -float(eff)
+    return withdrawal
+
+
+def _classify_co2_origin_from_carrier(carrier_name):
+    carrier = str(carrier_name).lower()
+    if "dac" in carrier:
+        return "dac"
+    biogenic_tokens = ("biomass", "biogas", "biosng", "btl", "fuelwood", "msw", "bio")
+    if any(token in carrier for token in biogenic_tokens):
+        return "biogenic"
+    return "fossil"
+
+
+CDR_CREDIT_ORIGINS = ("dac", "biogenic", "fossil")
+CDR_INFRASTRUCTURE_PREFIXES = (
+    "co2 pipeline",
+    "co2 sequestered",
+    "co2 vent",
+    "co2 provenance",
+)
+
+
+def _is_creditable_capture_link(n, link_name):
+    carrier = str(n.links.at[link_name, "carrier"]).lower()
+    if carrier.startswith(CDR_INFRASTRUCTURE_PREFIXES):
+        return False
+    return _get_positive_co2_output_per_dispatch(n, link_name) > 0
+
+
+def get_cdr_credit_prices(
+    cdr_credit_price,
+    cdr_credit_scope,
+    cdr_credit_prices_by_scope=None,
+):
+    if cdr_credit_prices_by_scope:
+        return {
+            str(scope): float(price)
+            for scope, price in cdr_credit_prices_by_scope.items()
+            if float(price) != 0.0
+        }
+
+    if float(cdr_credit_price) == 0.0:
+        return {}
+
+    if cdr_credit_scope == "all_sequestration":
+        return {origin: float(cdr_credit_price) for origin in CDR_CREDIT_ORIGINS}
+
+    eligible = {cdr_credit_scope} if isinstance(cdr_credit_scope, str) else set(cdr_credit_scope)
+    eligible.discard("all_sequestration")
+    return {origin: float(cdr_credit_price) for origin in eligible}
+
+
+def apply_cdr_credit_to_eligible_capture_links(
+    n,
+    cdr_credit_price,
+    cdr_credit_scope,
+    cdr_credit_prices_by_scope=None,
+    cdr_credit_timing: str = "capture",
+    co2_price: float = 0.0,
+    cdr_credit_standalone: bool = False,
+    solve_time_cdr_accounting: bool = False,
+):
+    if "marginal_cost" not in n.links.columns:
+        n.links["marginal_cost"] = 0.0
+    n.links["marginal_cost"] = n.links["marginal_cost"].fillna(0.0)
+
+    credit_prices = (
+        get_cdr_credit_prices(
+            cdr_credit_price=cdr_credit_price,
+            cdr_credit_scope=cdr_credit_scope,
+            cdr_credit_prices_by_scope=cdr_credit_prices_by_scope,
+        )
+        if cdr_credit_timing == "capture" or not solve_time_cdr_accounting
+        else {}
+    )
+    standalone_origins = {"dac", "biogenic"} if cdr_credit_standalone else set()
+
+    if cdr_credit_timing != "capture" and solve_time_cdr_accounting and credit_prices:
+        logger.info(
+            "Capture-link CDR crediting is disabled because sector.cdr_credit_timing=%s.",
+            cdr_credit_timing,
+        )
+    elif cdr_credit_timing != "capture" and not solve_time_cdr_accounting and (
+        credit_prices or standalone_origins
+    ):
+        logger.info(
+            "Falling back to build-time capture crediting for sector.cdr_credit_timing=%s "
+            "because solve-time sequestration accounting is unavailable in this foresight mode.",
+            cdr_credit_timing,
+        )
+
+    if not credit_prices and not standalone_origins:
+        return
+
+    for link_name in n.links.index:
+        if not _is_creditable_capture_link(n, link_name):
+            continue
+
+        co2_out = _get_positive_co2_output_per_dispatch(n, link_name)
+        origin = _classify_co2_origin_from_carrier(n.links.at[link_name, "carrier"])
+        price = credit_prices.get(origin, 0.0)
+        if price != 0.0:
+            n.links.at[link_name, "marginal_cost"] -= price * co2_out
+
+        # When solve-time sequestration accounting is available, ETS cancellation
+        # is deferred to the solver and applied only to the CDR-credited share
+        # that actually reaches geological storage. Otherwise we keep the legacy
+        # build-time approximation.
+        if origin in standalone_origins and co2_price != 0.0:
+            atmosphere_withdrawal = _get_co2_atmosphere_withdrawal_per_dispatch(
+                n, link_name
+            )
+            if atmosphere_withdrawal > 0.0:
+                n.links.at[link_name, "marginal_cost"] += co2_price * atmosphere_withdrawal
 
 
 def add_co2limit(n, options, co2_totals_file, countries, nyears, limit):
@@ -3804,7 +4136,39 @@ def add_biomass(
     """
     logger.info("Add biomass")
 
+    def _align_series_to_names(values, names, label):
+        """Align indexed inputs to PyPSA component names (PyPSA >=1.0 is strict)."""
+        if not isinstance(values, pd.Series):
+            return values
+
+        names = pd.Index(names)
+        if values.index.equals(names):
+            return values
+
+        missing = names.difference(values.index)
+        extra = values.index.difference(names)
+        if len(missing) or len(extra):
+            logger.warning(
+                "Aligning %s to component names (%d missing filled with 0, %d extra dropped).",
+                label,
+                len(missing),
+                len(extra),
+            )
+        return values.reindex(names, fill_value=0.0)
+
     biomass_potentials = pd.read_csv(biomass_potentials_file, index_col=0) * nyears
+
+    # Optional scaling factor to restrict solid-biomass availability.
+    # Keeps biogas and MSW unchanged while directly affecting BECCS headroom.
+    biomass_potential_factor = float(options.get("solid_biomass_potential_factor", 1.0))
+    if biomass_potential_factor != 1.0:
+        logger.info(
+            "Scaling solid biomass potentials by factor %.2f (solid_biomass_potential_factor).",
+            biomass_potential_factor,
+        )
+        for column in ["solid biomass", "unsustainable solid biomass"]:
+            if column in biomass_potentials.columns:
+                biomass_potentials[column] = biomass_potentials[column] * biomass_potential_factor
 
     # need to aggregate potentials if gas not nodally resolved
     if options["gas_network"]:
@@ -3846,6 +4210,33 @@ def add_biomass(
             "unsustainable bioliquids"
         ].sum()
 
+    biogas_potentials_spatial = _align_series_to_names(
+        biogas_potentials_spatial, spatial.gas.biogas, "biogas potentials"
+    )
+    unsustainable_biogas_potentials_spatial = _align_series_to_names(
+        unsustainable_biogas_potentials_spatial,
+        spatial.gas.biogas,
+        "unsustainable biogas potentials",
+    )
+    solid_biomass_potentials_spatial = _align_series_to_names(
+        solid_biomass_potentials_spatial, spatial.biomass.nodes, "solid biomass potentials"
+    )
+    msw_biomass_potentials_spatial = _align_series_to_names(
+        msw_biomass_potentials_spatial,
+        spatial.msw.nodes,
+        "municipal solid waste potentials",
+    )
+    unsustainable_solid_biomass_potentials_spatial = _align_series_to_names(
+        unsustainable_solid_biomass_potentials_spatial,
+        spatial.biomass.nodes_unsustainable,
+        "unsustainable solid biomass potentials",
+    )
+    unsustainable_liquid_biofuel_potentials_spatial = _align_series_to_names(
+        unsustainable_liquid_biofuel_potentials_spatial,
+        spatial.biomass.bioliquids,
+        "unsustainable bioliquids potentials",
+    )
+
     n.add("Carrier", "biogas")
     n.add("Carrier", "solid biomass")
 
@@ -3876,7 +4267,7 @@ def add_biomass(
             spatial.msw.nodes,
             bus=spatial.msw.nodes,
             carrier="municipal solid waste",
-            p_nom=msw_biomass_potentials_spatial,
+            p_nom=msw_biomass_potentials_spatial / (nyears * 8760),
             marginal_cost=0,  # costs.at["municipal solid waste", "fuel"],
             e_sum_min=msw_biomass_potentials_spatial,
             e_sum_max=msw_biomass_potentials_spatial,
@@ -3903,7 +4294,7 @@ def add_biomass(
         spatial.gas.biogas,
         bus=spatial.gas.biogas,
         carrier="biogas",
-        p_nom=biogas_potentials_spatial,
+        p_nom=biogas_potentials_spatial / (nyears * 8760),
         marginal_cost=costs.at["biogas", "fuel"],
         e_sum_min=0,
         e_sum_max=biogas_potentials_spatial,
@@ -3914,7 +4305,7 @@ def add_biomass(
         spatial.biomass.nodes,
         bus=spatial.biomass.nodes,
         carrier="solid biomass",
-        p_nom=solid_biomass_potentials_spatial,
+        p_nom=solid_biomass_potentials_spatial / (nyears * 8760),
         marginal_cost=costs.at["solid biomass", "fuel"],
         e_sum_min=0,
         e_sum_max=solid_biomass_potentials_spatial,
@@ -3977,7 +4368,7 @@ def add_biomass(
             suffix=" unsustainable",
             bus=spatial.gas.biogas,
             carrier="unsustainable biogas",
-            p_nom=unsustainable_biogas_potentials_spatial,
+            p_nom=unsustainable_biogas_potentials_spatial / (nyears * 8760),
             p_nom_extendable=False,
             marginal_cost=costs.at["biogas", "fuel"],
             e_sum_min=unsustainable_biogas_potentials_spatial,
@@ -3989,7 +4380,7 @@ def add_biomass(
             spatial.biomass.nodes_unsustainable,
             bus=spatial.biomass.nodes,
             carrier="unsustainable solid biomass",
-            p_nom=unsustainable_solid_biomass_potentials_spatial,
+            p_nom=unsustainable_solid_biomass_potentials_spatial / (nyears * 8760),
             p_nom_extendable=False,
             marginal_cost=costs.at["fuelwood", "fuel"],
             e_sum_min=unsustainable_solid_biomass_potentials_spatial,
@@ -4009,7 +4400,7 @@ def add_biomass(
             spatial.biomass.bioliquids,
             bus=spatial.biomass.bioliquids,
             carrier="unsustainable bioliquids",
-            p_nom=unsustainable_liquid_biofuel_potentials_spatial,
+            p_nom=unsustainable_liquid_biofuel_potentials_spatial / (nyears * 8760),
             p_nom_extendable=False,
             marginal_cost=costs.at["biodiesel crops", "fuel"],
             e_sum_min=unsustainable_liquid_biofuel_potentials_spatial,
@@ -4034,7 +4425,7 @@ def add_biomass(
             carrier="unsustainable bioliquids",
             efficiency=1,
             efficiency2=-costs.at["oil", "CO2 intensity"],
-            p_nom=unsustainable_liquid_biofuel_potentials_spatial,
+            p_nom=unsustainable_liquid_biofuel_potentials_spatial / (nyears * 8760),
             marginal_cost=costs.at["BtL", "VOM"],
         )
 
@@ -4256,7 +4647,13 @@ def add_biomass(
                 costs.at["biomass CHP capture", "electricity-input"]
                 + costs.at["biomass CHP capture", "compression-electricity-input"]
             ),
-            efficiency2=costs.at[key + " CC", "efficiency-heat"],
+            efficiency2=costs.at[key + " CC", "efficiency-heat"]
+            + costs.at["solid biomass", "CO2 intensity"]
+            * (
+                costs.at["biomass CHP capture", "heat-output"]
+                + costs.at["biomass CHP capture", "compression-heat-output"]
+                - costs.at["biomass CHP capture", "heat-input"]
+            ),
             efficiency3=-costs.at["solid biomass", "CO2 intensity"]
             * costs.at["biomass CHP capture", "capture_rate"],
             efficiency4=costs.at["solid biomass", "CO2 intensity"]
@@ -6305,6 +6702,25 @@ if __name__ == "__main__":
                 cf_industry=cf_industry,
             )
 
+        # Pre-create uranium fuel supply so that nuclear Links (added later by
+        # add_existing_baseyear / add_brownfield) can dispatch. The uranium Store
+        # starts at zero with no supply, so without this Generator nuclear is frozen.
+        uranium_bus = spatial.uranium.nodes[0]  # "EU uranium"
+        if uranium_bus not in n.buses.index:
+            n.add("Bus", uranium_bus, location="EU", carrier="uranium", unit="MWh_th",
+                  x=-5.5, y=46)
+        if "uranium" not in n.carriers.index:
+            n.add("Carrier", "uranium")
+        if uranium_bus not in n.generators.index:
+            n.add(
+                "Generator",
+                uranium_bus,
+                bus=uranium_bus,
+                p_nom_extendable=True,
+                carrier="uranium",
+                marginal_cost=costs.at["uranium", "fuel"],
+            )
+
     add_eu_bus(n)
 
     emission_prices = snakemake.params["emission_prices"]
@@ -6313,12 +6729,29 @@ if __name__ == "__main__":
         if emission_prices["enable"]
         else 0.0
     )
+    cdr_credit_price = get(options.get("cdr_credit_price", 0.0), investment_year)
+    cdr_credit_scope = options.get("cdr_credit_scope", "all_sequestration")
+    cdr_credit_timing = options.get("cdr_credit_timing", "capture")
+    raw_by_scope = options.get("cdr_credit_prices_by_scope", {})
+    cdr_credit_prices_by_scope = (
+        {scope: get(traj, investment_year) for scope, traj in raw_by_scope.items()}
+        if raw_by_scope
+        else {}
+    )
+    solve_time_cdr_accounting = (
+        cdr_credit_timing == "sequestration"
+        and snakemake.params.foresight != "perfect"
+    )
     add_co2_tracking(
         n,
         costs,
         options,
         sequestration_potential_file=snakemake.input.sequestration_potential,
         co2_price=co2_price,
+        cdr_credit_price=cdr_credit_price,
+        cdr_credit_scope=cdr_credit_scope,
+        cdr_credit_timing=cdr_credit_timing,
+        cdr_credit_prices_by_scope=cdr_credit_prices_by_scope,
     )
 
     add_generation(
@@ -6485,7 +6918,18 @@ if __name__ == "__main__":
         )
 
     if options["dac"]:
-        add_dac(n, costs)
+        add_dac(n, costs, options)
+
+    apply_cdr_credit_to_eligible_capture_links(
+        n=n,
+        cdr_credit_price=cdr_credit_price,
+        cdr_credit_scope=cdr_credit_scope,
+        cdr_credit_prices_by_scope=cdr_credit_prices_by_scope,
+        cdr_credit_timing=cdr_credit_timing,
+        co2_price=co2_price,
+        cdr_credit_standalone=options.get("cdr_credit_standalone", False),
+        solve_time_cdr_accounting=solve_time_cdr_accounting,
+    )
 
     if not options["electricity_transmission_grid"]:
         decentral(n)
@@ -6494,12 +6938,14 @@ if __name__ == "__main__":
         remove_h2_network(n)
 
     if options["co2_network"]:
+        co2_network_cost_factor = get(
+            options.get("co2_network_cost_factor", 1.0),
+            investment_year,
+        )
         add_co2_network(
             n,
             costs,
-            co2_network_cost_factor=snakemake.config["sector"][
-                "co2_network_cost_factor"
-            ],
+            co2_network_cost_factor=co2_network_cost_factor,
         )
 
     if options["allam_cycle_gas"]:

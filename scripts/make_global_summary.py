@@ -60,8 +60,17 @@ if __name__ == "__main__":
 
         summaries = []
         for _, filename in summaries_dict.items():
-            s = pd.read_csv(filename, index_col=list(range(INDEX_COLS[kind])))
-            summaries.append(s)
+            try:
+                s = pd.read_csv(filename, index_col=list(range(INDEX_COLS[kind])))
+            except (FileNotFoundError, pd.errors.EmptyDataError):
+                s = pd.DataFrame()
+            # Header-only CSVs (unsolved networks) produce DataFrames with 0
+            # data columns; convert to an empty Series so concat still gets
+            # exactly one column per planning horizon.
+            if s.empty or s.columns.empty:
+                summaries.append(pd.Series(dtype=float))
+            else:
+                summaries.append(s.iloc[:, 0])
 
         summaries = pd.concat(summaries, axis=1)
 

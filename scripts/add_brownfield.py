@@ -56,8 +56,12 @@ def add_brownfield(
 
     # electric transmission grid set optimised capacities of previous as minimum
     n.lines.s_nom_min = n_p.lines.s_nom_opt
+    n.lines.s_nom_max = n.lines[["s_nom_max", "s_nom_min"]].max(axis=1)
     dc_i = n.links[n.links.carrier == "DC"].index
     n.links.loc[dc_i, "p_nom_min"] = n_p.links.loc[dc_i, "p_nom_opt"]
+    n.links.loc[dc_i, "p_nom_max"] = n.links.loc[
+        dc_i, ["p_nom_max", "p_nom_min"]
+    ].max(axis=1)
 
     for c in n_p.iterate_components(["Link", "Generator", "Store"]):
         attr = "e" if c.name == "Store" else "p"
@@ -185,10 +189,26 @@ def disable_grid_expansion_if_limit_hit(n):
                 )
             ).sum()
 
-            # Allow small numerical differences
-            if np.abs(glc.constant - total_expansion) / glc.constant < 1e-6:
+            if glc.constant <= 0:
+                continue
+
+            relative_margin = (glc.constant - total_expansion) / glc.constant
+
+            # In myopic brownfield runs, inherited AC/DC minimum capacities can
+            # land infinitesimally above the transmission expansion cap after
+            # cost updates or solver roundoff. Treat such cases as a hit cap and
+            # freeze the grid instead of leaving an infeasible lower-bound/cap
+            # pair in the next horizon.
+            if relative_margin <= 1e-4:
                 logger.info(
-                    f"Transmission expansion {limit_type} is already reached, disabling expansion and limit"
+                    "Transmission expansion %s limit is reached by brownfield "
+                    "minimum capacity; disabling expansion and dropping limit "
+                    "%s (minimum %.6e, limit %.6e, relative margin %.3e)",
+                    limit_type,
+                    name,
+                    total_expansion,
+                    glc.constant,
+                    relative_margin,
                 )
                 extendable_acs = n.lines.query("s_nom_extendable").index
                 n.lines.loc[extendable_acs, "s_nom_extendable"] = False

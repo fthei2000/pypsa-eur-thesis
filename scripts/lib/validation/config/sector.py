@@ -733,8 +733,54 @@ class SectorConfig(BaseModel):
     co2_sequestration_cost: float = Field(
         30, description="The cost of sequestering a ton of CO2 (currency/tCO2)."
     )
+    co2_sequestration_cost_by_country: dict[str, float] = Field(
+        default_factory=dict,
+        description="Optional ISO2-specific overrides for CO2 sequestration cost (currency/tCO2).",
+    )
+    co2_sequestration_cost_by_node: dict[str, float] = Field(
+        default_factory=dict,
+        description="Optional node-specific overrides for CO2 sequestration cost (currency/tCO2).",
+    )
     co2_sequestration_lifetime: int = Field(
         50, description="The lifetime of a CO2 sequestration site (years)."
+    )
+    cdr_credit_price: float | dict[int, float] = Field(
+        0.0,
+        description="Standalone CDR credit price trajectory (currency/tCO2). Can be scalar or year-indexed dictionary.",
+    )
+    cdr_credit_scope: str | list[str] = Field(
+        "all_sequestration",
+        description='Crediting scope. Use "all_sequestration" for a uniform credit on all sequestration. Use a list like ["dac", "biogenic"] for eligibility-aware crediting applied to eligible capture pathways only.',
+    )
+    cdr_credit_timing: str = Field(
+        "capture",
+        description=(
+            "Where credited CDR is issued. Use 'capture' for legacy behavior that "
+            "credits eligible capture links when CO2 enters the CO2 network. Use "
+            "'sequestration' to credit only permanent geological sequestration. "
+            "With sequestration timing, the solver tracks credited DAC, biogenic, "
+            "and fossil removals separately in an accounting layer while the physical "
+            "CO2 network remains shared."
+        ),
+    )
+    cdr_credit_prices_by_scope: dict[str, float | dict[int, float]] = Field(
+        default_factory=dict,
+        description=(
+            "Per-scope CDR credit price trajectories (currency/tCO2). "
+            "Keys are origin scopes: 'dac', 'biogenic', or 'fossil'. "
+            "Values are scalars or year-indexed dicts. "
+            "When non-empty, this overrides cdr_credit_price/cdr_credit_scope for "
+            "capture links. With sequestration-timed crediting, the solver applies "
+            "different origin-specific prices to credited permanent removals in a "
+            "separate accounting layer."
+        ),
+    )
+    dac_variants: dict[str, Any] = Field(
+        default_factory=lambda: {
+            "enable": False,
+            "variants": {},
+        },
+        description="Optional DAC technology variants. If enabled, each variant creates a separate DAC link with parameter multipliers.",
     )
     co2_spatial: bool = Field(
         True,
@@ -744,9 +790,9 @@ class SectorConfig(BaseModel):
         True,
         description="Add option for planning a new carbon dioxide transmission network.",
     )
-    co2_network_cost_factor: float = Field(
+    co2_network_cost_factor: float | dict[int, float] = Field(
         1,
-        description="The cost factor for the capital cost of the carbon dioxide transmission network.",
+        description="The cost factor for the capital cost of the carbon dioxide transmission network. If given as a dictionary, specify values by investment year.",
     )
     cc_fraction: float = Field(
         0.9,

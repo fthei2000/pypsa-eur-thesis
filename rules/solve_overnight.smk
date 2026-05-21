@@ -12,6 +12,13 @@ rule solve_sector_network:
         co2_sequestration_potential=config_provider(
             "sector", "co2_sequestration_potential", default=200
         ),
+        cdr_credit_limit=config_provider("sector", "cdr_credit_limit_by_year", default=None),
+        cdr_credit_scope=config_provider("sector", "cdr_credit_scope", default=[]),
+        cdr_credit_timing=config_provider("sector", "cdr_credit_timing", default="capture"),
+        cdr_credit_price=config_provider("sector", "cdr_credit_price", default=0.0),
+        cdr_credit_prices_by_scope=config_provider("sector", "cdr_credit_prices_by_scope", default={}),
+        cdr_credit_standalone=config_provider("sector", "cdr_credit_standalone", default=False),
+        emission_prices_co2=config_provider("costs", "emission_prices", "co2", default={}),
         custom_extra_functionality=input_custom_extra_functionality,
     input:
         network=resources(

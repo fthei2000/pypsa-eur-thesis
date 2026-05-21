@@ -140,6 +140,16 @@ rule all:
             ),
             run=config["run"]["name"],
         ),
+        lambda w: expand(
+            (
+                RESULTS
+                + "csvs/individual/cdr_credit_accounting_s_{clusters}_{opts}_{sector_opts}_{planning_horizons}.csv"
+                if config_provider("foresight")(w) == "myopic"
+                else []
+            ),
+            run=config["run"]["name"],
+            **config["scenario"],
+        ),
         expand(
             RESULTS
             + "graphics/balance_timeseries/s_{clusters}_{opts}_{sector_opts}_{planning_horizons}",

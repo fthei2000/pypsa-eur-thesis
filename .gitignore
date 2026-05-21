@@ -87,6 +87,11 @@ CLAUDE.md
 .claude/
 .github/copilot-instructions.md
 CLAUDE.local.md
+# team run wrapper artifacts
+.team_runs/
 # pixi environments
 .pixi/*
 !.pixi/config.toml
+
+/cutouts_tmp
+/figures

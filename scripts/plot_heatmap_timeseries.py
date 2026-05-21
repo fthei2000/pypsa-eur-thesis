@@ -19,6 +19,15 @@ from scripts._helpers import configure_logging, get_snapshots, set_scenario_conf
 logger = logging.getLogger(__name__)
 
 
+def group_by_carrier(obj: pd.Series | pd.DataFrame) -> pd.Series | pd.DataFrame:
+    index_names = getattr(obj.index, "names", [])
+    if "carrier" in index_names:
+        return obj.groupby(level="carrier").sum()
+    if hasattr(obj, "columns") and "carrier" in obj.columns:
+        return obj.groupby("carrier").sum()
+    raise KeyError("carrier")
+
+
 def unstack_day_hour(
     s: pd.Series, sns: pd.DatetimeIndex, drop_leap_day: bool = True
 ) -> pd.DataFrame:
@@ -110,6 +119,9 @@ if __name__ == "__main__":
     os.makedirs(output_dir, exist_ok=True)
 
     n = pypsa.Network(snakemake.input.network)
+    if getattr(n, "objective", None) is None:
+        logger.warning("Network has no solved objective. Skipping heatmaps.")
+        sys.exit(0)
 
     snapshots = get_snapshots(snakemake.params.snapshots, drop_leap_day)
     carriers = n.carriers
@@ -122,19 +134,13 @@ if __name__ == "__main__":
         sys.exit(0)
 
     # filter for build capacities
-    optimal_capacity = (
-        n.statistics.optimal_capacity(nice_names=False).groupby("carrier").sum()
-    )
+    optimal_capacity = group_by_carrier(n.statistics.optimal_capacity(nice_names=False))
     built_idx = optimal_capacity.where(optimal_capacity > 100).dropna().index
 
     # utilisation rates
-    cf = (
-        n.statistics.capacity_factor(aggregate_time=False, nice_names=False)
-        .dropna()
-        .groupby("carrier")
-        .sum()
-        .mul(100)
-    )
+    cf = group_by_carrier(
+        n.statistics.capacity_factor(aggregate_time=False, nice_names=False).dropna()
+    ).mul(100)
     idx = cf.index.intersection(config["utilisation_rate"]).intersection(built_idx)
     cf = cf.loc[idx]
 

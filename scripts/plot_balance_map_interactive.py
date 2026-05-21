@@ -8,6 +8,7 @@ Create interactive energy balance maps for the defined carriers using `n.explore
 import geopandas as gpd
 import matplotlib.colors as mcolors
 import matplotlib.pyplot as plt
+import pandas as pd
 import pydeck as pdk
 import pypsa
 from pypsa.plot.maps.interactive import PydeckPlotter
@@ -129,10 +130,18 @@ if __name__ == "__main__":
 
     # Only carriers that are also in the energy balance
     carriers_in_eb = carriers[carriers.isin(eb.index.get_level_values("carrier"))]
+    components_in_eb = components[components.isin(eb.index.get_level_values("component"))]
 
-    eb.loc[components] = eb.loc[components].drop(index=carriers_in_eb, level="carrier")
+    if len(components_in_eb) and len(carriers_in_eb):
+        eb.loc[components_in_eb] = eb.loc[components_in_eb].drop(
+            index=carriers_in_eb,
+            level="carrier",
+            errors="ignore",
+        )
     eb = eb.dropna()
     bus_size = eb.groupby(level=["bus", "carrier"]).sum()
+    if bus_size.empty:
+        bus_size = 0.0
 
     # line and links widths according to optimal capacity
     flow = n.statistics.transmission(groupby=False, bus_carrier=carrier)
@@ -174,20 +183,24 @@ if __name__ == "__main__":
     )
 
     weights = n.snapshot_weightings.generators
-    price = (
-        weights
-        @ n.buses_t.marginal_price.reindex(buses, axis=1).rename(
-            n.buses.location, axis=1
+    marginal_prices = n.buses_t.marginal_price.reindex(columns=buses)
+
+    if marginal_prices.empty:
+        price = pd.Series(dtype=float)
+    else:
+        price = (
+            weights @ marginal_prices.rename(n.buses.location, axis=1) / weights.sum()
         )
-        / weights.sum()
-    )
 
     if carrier == "co2 stored" and "CO2Limit" in n.global_constraints.index:
         co2_price = n.global_constraints.loc["CO2Limit", "mu"]
         price = price - co2_price
 
     # if only one price is available, use this price for all regions
-    if price.size == 1:
+    if price.empty:
+        regions["price"] = 0.0
+        shift = 0
+    elif price.size == 1:
         regions["price"] = price.values[0]
         shift = round(abs(price.values[0]) / 20, 0)
     else:
@@ -237,7 +250,7 @@ if __name__ == "__main__":
 
     map = n.explore(
         branch_components=branch_components,
-        bus_size=bus_size.div(unit_conversion),
+        bus_size=bus_size.div(unit_conversion) if hasattr(bus_size, "div") else bus_size / unit_conversion,
         bus_split_circle=True,
         line_width=line_flow.div(unit_conversion),
         line_flow=line_flow.div(unit_conversion),

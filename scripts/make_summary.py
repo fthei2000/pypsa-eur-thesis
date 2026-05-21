@@ -226,13 +226,24 @@ def calculate_metrics(n: pypsa.Network) -> pd.Series:
     metrics["total costs"] = n.statistics.capex().sum() + n.statistics.opex().sum()
 
     buses_i = n.buses.query("carrier == 'AC'").index
-    prices = n.buses_t.marginal_price[buses_i]
+    price_columns = n.buses_t.marginal_price.columns.intersection(buses_i)
 
-    # threshold higher than marginal_cost of VRE
-    zero_hours = prices.where(prices < 0.1).count().sum()
-    metrics["electricity_price_zero_hours"] = zero_hours / prices.size
-    metrics["electricity_price_mean"] = prices.unstack().mean()
-    metrics["electricity_price_std"] = prices.unstack().std()
+    if len(price_columns):
+        prices = n.buses_t.marginal_price.loc[:, price_columns]
+
+        # threshold higher than marginal_cost of VRE
+        zero_hours = prices.where(prices < 0.1).count().sum()
+        metrics["electricity_price_zero_hours"] = zero_hours / prices.size
+        metrics["electricity_price_mean"] = prices.unstack().mean()
+        metrics["electricity_price_std"] = prices.unstack().std()
+    else:
+        logger.info(
+            "No AC marginal prices available in solved network; "
+            "electricity price metrics set to NaN."
+        )
+        metrics["electricity_price_zero_hours"] = float("nan")
+        metrics["electricity_price_mean"] = float("nan")
+        metrics["electricity_price_std"] = float("nan")
 
     if "lv_limit" in n.global_constraints.index:
         metrics["line_volume_limit"] = n.global_constraints.at["lv_limit", "constant"]

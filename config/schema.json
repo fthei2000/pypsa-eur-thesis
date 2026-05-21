@@ -753,8 +753,8 @@
               "type": "null"
             }
           ],
-          "default": "data/custom_costs.csv",
-          "description": "Path to the custom costs file. None if it should not be used. Default `data/custom_costs.csv` contains minor adjustments for stabilising the optimisation results."
+          "default": "data/costs/custom_costs_medium.csv",
+          "description": "Path to the custom costs file. None if it should not be used. Default `data/costs/custom_costs_medium.csv` contains minor adjustments for stabilising the optimisation results."
         },
         "overwrites": {
           "additionalProperties": {
@@ -4603,10 +4603,76 @@
           "description": "The cost of sequestering a ton of CO2 (currency/tCO2).",
           "type": "number"
         },
+        "co2_sequestration_cost_by_country": {
+          "additionalProperties": {
+            "type": "number"
+          },
+          "description": "Optional ISO2-specific overrides for CO2 sequestration cost (currency/tCO2).",
+          "type": "object"
+        },
+        "co2_sequestration_cost_by_node": {
+          "additionalProperties": {
+            "type": "number"
+          },
+          "description": "Optional node-specific overrides for CO2 sequestration cost (currency/tCO2).",
+          "type": "object"
+        },
         "co2_sequestration_lifetime": {
           "default": 50,
           "description": "The lifetime of a CO2 sequestration site (years).",
           "type": "integer"
+        },
+        "cdr_credit_price": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "additionalProperties": {
+                "type": "number"
+              },
+              "type": "object"
+            }
+          ],
+          "default": 0.0,
+          "description": "Standalone CDR credit price trajectory (currency/tCO2). Can be scalar or year-indexed dictionary."
+        },
+        "cdr_credit_scope": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            }
+          ],
+          "default": "all_sequestration",
+          "description": "Crediting scope. Use \"all_sequestration\" for a uniform credit on all sequestration. Use a list like [\"dac\", \"biogenic\"] for eligibility-aware crediting applied to eligible capture pathways only."
+        },
+        "dac_variants": {
+          "additionalProperties": true,
+          "description": "Optional DAC technology variants. If enabled, each variant creates a separate DAC link with parameter multipliers.",
+          "type": "object"
+        },
+        "dac_weather_factors": {
+          "additionalProperties": false,
+          "description": "Country-level DAC weather scaling factors derived from ERA5 climate data. When enabled, per-node electricity and heat demands are scaled by factors from the CSV file.",
+          "properties": {
+            "enable": {
+              "default": false,
+              "description": "Apply country/weather-specific electricity and heat demand scaling to DAC variants that have a weather_type set.",
+              "type": "boolean"
+            },
+            "file": {
+              "default": "data/dac_country_weather_factors.csv",
+              "description": "Path to the weather factors CSV produced by build_dac_country_weather_factors.py.",
+              "type": "string"
+            }
+          },
+          "type": "object"
         },
         "co2_spatial": {
           "default": true,
@@ -10851,10 +10917,76 @@
           "description": "The cost of sequestering a ton of CO2 (currency/tCO2).",
           "type": "number"
         },
+        "co2_sequestration_cost_by_country": {
+          "additionalProperties": {
+            "type": "number"
+          },
+          "description": "Optional ISO2-specific overrides for CO2 sequestration cost (currency/tCO2).",
+          "type": "object"
+        },
+        "co2_sequestration_cost_by_node": {
+          "additionalProperties": {
+            "type": "number"
+          },
+          "description": "Optional node-specific overrides for CO2 sequestration cost (currency/tCO2).",
+          "type": "object"
+        },
         "co2_sequestration_lifetime": {
           "default": 50,
           "description": "The lifetime of a CO2 sequestration site (years).",
           "type": "integer"
+        },
+        "cdr_credit_price": {
+          "anyOf": [
+            {
+              "type": "number"
+            },
+            {
+              "additionalProperties": {
+                "type": "number"
+              },
+              "type": "object"
+            }
+          ],
+          "default": 0.0,
+          "description": "Standalone CDR credit price trajectory (currency/tCO2). Can be scalar or year-indexed dictionary."
+        },
+        "cdr_credit_scope": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            }
+          ],
+          "default": "all_sequestration",
+          "description": "Crediting scope. Use \"all_sequestration\" for a uniform credit on all sequestration. Use a list like [\"dac\", \"biogenic\"] for eligibility-aware crediting applied to eligible capture pathways only."
+        },
+        "dac_variants": {
+          "additionalProperties": true,
+          "description": "Optional DAC technology variants. If enabled, each variant creates a separate DAC link with parameter multipliers.",
+          "type": "object"
+        },
+        "dac_weather_factors": {
+          "additionalProperties": false,
+          "description": "Country-level DAC weather scaling factors derived from ERA5 climate data. When enabled, per-node electricity and heat demands are scaled by factors from the CSV file.",
+          "properties": {
+            "enable": {
+              "default": false,
+              "description": "Apply country/weather-specific electricity and heat demand scaling to DAC variants that have a weather_type set.",
+              "type": "boolean"
+            },
+            "file": {
+              "default": "data/dac_country_weather_factors.csv",
+              "description": "Path to the weather factors CSV produced by build_dac_country_weather_factors.py.",
+              "type": "string"
+            }
+          },
+          "type": "object"
         },
         "co2_spatial": {
           "default": true,
@@ -11548,8 +11680,8 @@
               "type": "null"
             }
           ],
-          "default": "data/custom_costs.csv",
-          "description": "Path to the custom costs file. None if it should not be used. Default `data/custom_costs.csv` contains minor adjustments for stabilising the optimisation results."
+          "default": "data/costs/custom_costs_medium.csv",
+          "description": "Path to the custom costs file. None if it should not be used. Default `data/costs/custom_costs_medium.csv` contains minor adjustments for stabilising the optimisation results."
         },
         "overwrites": {
           "additionalProperties": {

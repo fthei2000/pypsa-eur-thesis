@@ -335,7 +335,10 @@ if __name__ == "__main__":
     if snakemake.params.gaslimit_enable:
         add_gaslimit(n, snakemake.params.gaslimit, Nyears)
 
-    maybe_adjust_costs_and_potentials(n, snakemake.params["adjustments"])
+    investment_year = int(snakemake.params.cost_year)
+    maybe_adjust_costs_and_potentials(
+        n, snakemake.params["adjustments"], investment_year=investment_year
+    )
 
     emission_prices = snakemake.params.emission_prices
     if emission_prices["dynamic"]:
@@ -344,13 +347,8 @@ if __name__ == "__main__":
         )
         add_dynamic_emission_prices(n, snakemake.input.co2_price)
     elif emission_prices["enable"]:
-        if isinstance(emission_prices["co2"], dict):
-            logger.warning(
-                "Not setting emission prices on generators and storage units, "
-                "due to their configuration per planning horizon"
-            )
-        elif isinstance(emission_prices["co2"], float):
-            add_emission_prices(n, dict(co2=emission_prices["co2"]))
+        co2_price = get(emission_prices["co2"], investment_year)
+        add_emission_prices(n, dict(co2=co2_price))
 
     kind = snakemake.params.transmission_limit[0]
     factor = snakemake.params.transmission_limit[1:]

@@ -978,6 +978,32 @@ if (BFS_GDP_AND_POPULATION_DATASET := dataset_version("bfs_gdp_and_population"))
             copy2(input["xlsx"], output["xlsx"])
 
 
+def get_local_wdpa_cache(
+    dataset_name: str,
+    filename: str,
+    *,
+    sources: tuple[str, ...] = ("primary", "archive"),
+) -> str | None:
+    """Prefer already-downloaded local WDPA snapshots to avoid brittle remote lookups."""
+    versions = {"primary": "unknown", "archive": "2025-07"}
+    candidates = [
+        Path("data", dataset_name, source, versions[source], filename)
+        for source in sources
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate.as_posix()
+    return None
+
+
+def get_wdpa_input(DATASET, filename: str):
+    sources = ("primary",) if DATASET["source"] == "archive" else ("primary", "archive")
+    local_cache = get_local_wdpa_cache(DATASET["dataset"], filename, sources=sources)
+    if local_cache is not None:
+        return local_cache
+    return ancient(storage(get_wdpa_url(DATASET)))
+
+
 def get_wdpa_url(DATASET) -> str:
     """
     Find the right URL for the WDPA / WDPA marine dataset based on the source type.
@@ -1028,28 +1054,38 @@ if (WDPA_DATASET := dataset_version("wdpa"))["source"] in [
         message:
             "Downloading protected area database from WDPA"
         input:
-            zip_file=storage(get_wdpa_url(WDPA_DATASET)),
+            zip_file=get_wdpa_input(WDPA_DATASET, "WDPA_shp.zip"),
         output:
             zip_file=f"{WDPA_DATASET['folder']}/WDPA_shp.zip",
             gpkg=f"{WDPA_DATASET['folder']}/WDPA.gpkg",
         run:
             output_folder = Path(output["zip_file"]).parent
+            cache_sources = (
+                ("primary",)
+                if WDPA_DATASET["source"] == "archive"
+                else ("primary", "archive")
+            )
+            local_gpkg = get_local_wdpa_cache("wdpa", "WDPA.gpkg", sources=cache_sources)
             copy2(input["zip_file"], output["zip_file"])
-            unpack_archive(output["zip_file"], output_folder)
 
-            # Extract {bYYYY} from the input file / URL
-            bYYYY = re.search(
-                r"WDPA_(\w{3}\d{4})_Public_shp.zip",
-                input["zip_file"],
-            ).group(1)
+            if local_gpkg is not None and Path(input["zip_file"]).name == "WDPA_shp.zip":
+                copy2(local_gpkg, output["gpkg"])
+            else:
+                unpack_archive(output["zip_file"], output_folder)
 
-            for i in range(3):
-                # vsizip is special driver for directly working with zipped shapefiles in ogr2ogr
-                layer_path = (
-                    f"/vsizip/{output_folder}/WDPA_{bYYYY}_Public_shp_{i}.zip"
-                )
-                print(f"Adding layer {i+1} of 3 to combined output file.")
-                shell("ogr2ogr -f gpkg -update -append {output.gpkg} {layer_path}")
+                # Extract {bYYYY} from the input file / URL
+                bYYYY = re.search(
+                    r"WDPA_(\w{3}\d{4})_Public_shp.zip",
+                    input["zip_file"],
+                ).group(1)
+
+                for i in range(3):
+                    # vsizip is special driver for directly working with zipped shapefiles in ogr2ogr
+                    layer_path = (
+                        f"/vsizip/{output_folder}/WDPA_{bYYYY}_Public_shp_{i}.zip"
+                    )
+                    print(f"Adding layer {i+1} of 3 to combined output file.")
+                    shell("ogr2ogr -f gpkg -update -append {output.gpkg} {layer_path}")
 
 
 
@@ -1065,26 +1101,40 @@ if (WDPA_MARINE_DATASET := dataset_version("wdpa_marine"))["source"] in [
         message:
             "Downloading Marine protected area database from WDPA"
         input:
-            zip_file=storage(get_wdpa_url(WDPA_MARINE_DATASET)),
+            zip_file=get_wdpa_input(WDPA_MARINE_DATASET, "WDPA_WDOECM_marine.zip"),
         output:
             zip_file=f"{WDPA_MARINE_DATASET['folder']}/WDPA_WDOECM_marine.zip",
             gpkg=f"{WDPA_MARINE_DATASET['folder']}/WDPA_WDOECM_marine.gpkg",
         run:
             output_folder = Path(output["zip_file"]).parent
+            cache_sources = (
+                ("primary",)
+                if WDPA_MARINE_DATASET["source"] == "archive"
+                else ("primary", "archive")
+            )
+            local_gpkg = get_local_wdpa_cache(
+                "wdpa_marine",
+                "WDPA_WDOECM_marine.gpkg",
+                sources=cache_sources,
+            )
             copy2(input["zip_file"], output["zip_file"])
-            unpack_archive(output["zip_file"], output_folder)
 
-            # Extract {bYYYY} from the input file / URL
-            bYYYY = re.search(
-                r"WDPA_WDOECM_(\w{3}\d{4})_Public_marine_shp.zip",
-                input["zip_file"],
-            ).group(1)
+            if local_gpkg is not None and Path(input["zip_file"]).name == "WDPA_WDOECM_marine.zip":
+                copy2(local_gpkg, output["gpkg"])
+            else:
+                unpack_archive(output["zip_file"], output_folder)
 
-            for i in range(3):
-                # vsizip is special driver for directly working with zipped shapefiles in ogr2ogr
-                layer_path = f"/vsizip/{output_folder}/WDPA_WDOECM_{bYYYY}_Public_marine_shp_{i}.zip"
-                print(f"Adding layer {i+1} of 3 to combined output file.")
-                shell("ogr2ogr -f gpkg -update -append {output.gpkg} {layer_path}")
+                # Extract {bYYYY} from the input file / URL
+                bYYYY = re.search(
+                    r"WDPA_WDOECM_(\w{3}\d{4})_Public_marine_shp.zip",
+                    input["zip_file"],
+                ).group(1)
+
+                for i in range(3):
+                    # vsizip is special driver for directly working with zipped shapefiles in ogr2ogr
+                    layer_path = f"/vsizip/{output_folder}/WDPA_WDOECM_{bYYYY}_Public_marine_shp_{i}.zip"
+                    print(f"Adding layer {i+1} of 3 to combined output file.")
+                    shell("ogr2ogr -f gpkg -update -append {output.gpkg} {layer_path}")
 
 
 

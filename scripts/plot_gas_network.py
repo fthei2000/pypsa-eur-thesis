@@ -21,10 +21,35 @@ from scripts.plot_power_network import load_projection
 logger = logging.getLogger(__name__)
 
 
+def save_placeholder_plot(output: str, message: str) -> None:
+    fig, ax = plt.subplots(figsize=(7, 2.5))
+    ax.axis("off")
+    ax.text(
+        0.5,
+        0.62,
+        "Methane network plot skipped",
+        ha="center",
+        va="center",
+        fontsize=14,
+        fontweight="bold",
+    )
+    ax.text(0.5, 0.38, message, ha="center", va="center", wrap=True)
+    fig.savefig(output, bbox_inches="tight")
+    plt.close(fig)
+
+
 @retry
 def plot_ch4_map(n):
     # if "gas pipeline" not in n.links.carrier.unique():
     #     return
+
+    if getattr(n, "objective", None) is None:
+        logger.info("Network has no solved objective; skipping gas network plot.")
+        save_placeholder_plot(
+            snakemake.output.map,
+            "Network has no solved objective, so no methane network is available.",
+        )
+        return
 
     assign_locations(n)
 
@@ -37,23 +62,27 @@ def plot_ch4_map(n):
     n.buses.drop(n.buses.index[n.buses.carrier != "AC"], inplace=True)
 
     fossil_gas_i = n.generators[n.generators.carrier == "gas"].index
-    fossil_gas = (
-        n.generators_t.p.loc[:, fossil_gas_i]
-        .mul(n.snapshot_weightings.generators, axis=0)
-        .sum()
-        .groupby(n.generators.loc[fossil_gas_i, "bus"])
-        .sum()
-        / bus_size_factor
-    )
-    fossil_gas.rename(index=lambda x: x.replace(" gas", ""), inplace=True)
-    fossil_gas = fossil_gas.reindex(n.buses.index).fillna(0)
+    fossil_gas = pd.Series(0.0, index=n.buses.index)
+    if fossil_gas_i.empty:
+        logger.info("No fossil gas generators; omitting fossil gas bus markers.")
+    else:
+        fossil_gas = (
+            n.generators_t.p.reindex(columns=fossil_gas_i).fillna(0)
+            .mul(n.snapshot_weightings.generators, axis=0)
+            .sum()
+            .groupby(n.generators.loc[fossil_gas_i, "bus"])
+            .sum()
+            / bus_size_factor
+        )
+        fossil_gas.rename(index=lambda x: x.replace(" gas", ""), inplace=True)
+        fossil_gas = fossil_gas.reindex(n.buses.index).fillna(0)
     # make a fake MultiIndex so that area is correct for legend
     fossil_gas.index = pd.MultiIndex.from_product([fossil_gas.index, ["fossil gas"]])
 
     methanation_i = n.links.query("carrier == 'Sabatier'").index
     methanation = (
         abs(
-            n.links_t.p1.loc[:, methanation_i].mul(
+            n.links_t.p1.reindex(columns=methanation_i).fillna(0).mul(
                 n.snapshot_weightings.generators, axis=0
             )
         )
@@ -72,7 +101,7 @@ def plot_ch4_map(n):
 
     biogas_i = n.stores[n.stores.carrier == "biogas"].index
     biogas = (
-        n.stores_t.p.loc[:, biogas_i]
+        n.stores_t.p.reindex(columns=biogas_i).fillna(0)
         .mul(n.snapshot_weightings.generators, axis=0)
         .sum()
         .groupby(n.stores.loc[biogas_i, "bus"])

@@ -32,9 +32,11 @@ import os
 import re
 import sys
 from functools import partial
+from pathlib import Path
 from typing import Any
 
 import linopy
+import linopy.io
 import numpy as np
 import pandas as pd
 import pypsa
@@ -52,8 +54,129 @@ from scripts._helpers import (
     set_scenario_config,
     update_config_from_wildcards,
 )
+from scripts.add_brownfield import disable_grid_expansion_if_limit_hit
 
 logger = logging.getLogger(__name__)
+
+
+DEFAULT_DIAGNOSTIC_SLACK_PATTERNS = {
+    "global": [r"^GlobalConstraint-", r"co2_sequestration_limit"],
+    "cdr": [r"^cdr_", r"^CDR-", r"^CO2AnnualCDRSeq"],
+    "biomass": [r"biomass", r"biogas", r"solid.?biomass"],
+    "stores": [r"^Store-.*(energy_balance|e_cyclic|e_initial|e_lower|e_upper)"],
+    "load_balance": [r"^Bus-nodal_balance$"],
+    "imports": [r"^import_limit$"],
+    "growth": [r"growth", r"agg_p_nom", r"bau_mincaps", r"safe_mintotalcap"],
+}
+
+
+def _transmission_expansion_cost_reference(n: pypsa.Network) -> float:
+    """Return the AC/DC reference cost used for cost-based grid limits."""
+    links_dc_b = n.links.carrier == "DC" if not n.links.empty else pd.Series()
+
+    lines_s_nom = n.lines.s_nom
+    typed_lines = n.lines.type != ""
+    if typed_lines.any():
+        typed_s_nom = (
+            np.sqrt(3)
+            * n.lines.loc[typed_lines, "type"].map(n.line_types.i_nom)
+            * n.lines.loc[typed_lines, "num_parallel"]
+            * n.lines.loc[typed_lines, "bus0"].map(n.buses.v_nom)
+        )
+        lines_s_nom = lines_s_nom.where(~typed_lines, typed_s_nom)
+
+    return (
+        lines_s_nom @ n.lines.capital_cost
+        + n.links.loc[links_dc_b, "p_nom"] @ n.links.loc[links_dc_b, "capital_cost"]
+    )
+
+
+def _rescale_transmission_expansion_cost_limits(
+    n: pypsa.Network, reference_before: float
+) -> None:
+    """Keep cost-based grid limits consistent after line/link cost perturbations."""
+    if reference_before <= 0:
+        return
+
+    glcs = n.global_constraints.query("type == 'transmission_expansion_cost_limit'")
+    if glcs.empty:
+        return
+
+    reference_after = _transmission_expansion_cost_reference(n)
+    if reference_after <= 0:
+        return
+
+    factor = reference_after / reference_before
+    for name in glcs.index:
+        n.global_constraints.at[name, "constant"] *= factor
+        logger.info(
+            "Rescaled transmission expansion cost limit %s after noisy_costs "
+            "(factor %.9f)",
+            name,
+            factor,
+        )
+
+
+def patch_linopy_highspy_name_export() -> None:
+    """Avoid allocating millions of string labels when exporting MPS via HiGHS."""
+    if getattr(linopy.io, "_pypsa_highspy_name_export_patched", False):
+        return
+
+    def _to_highspy_without_names(m, explicit_coordinate_names: bool = False):
+        if m.variables.sos:
+            raise NotImplementedError(
+                "SOS constraints are not supported by the HiGHS direct API. "
+                "Use io_api='lp' instead."
+            )
+
+        import highspy
+        from scipy.sparse import triu
+
+        M = m.matrices
+        h = highspy.Highs()
+        h.addVars(len(M.vlabels), M.lb, M.ub)
+        if len(m.binaries) + len(m.integers):
+            vtypes = M.vtypes
+            labels = np.arange(len(vtypes))[(vtypes == "B") | (vtypes == "I")]
+            n = len(labels)
+            h.changeColsIntegrality(n, labels, np.ones_like(labels))
+            if len(m.binaries):
+                labels = np.arange(len(vtypes))[vtypes == "B"]
+                n = len(labels)
+                h.changeColsBounds(
+                    n, labels, np.zeros_like(labels), np.ones_like(labels)
+                )
+
+        h.changeColsCost(len(M.c), np.arange(len(M.c), dtype=np.int32), M.c)
+
+        A = M.A
+        if A is not None:
+            A = A.tocsr()
+            num_cons = A.shape[0]
+            lower = np.where(M.sense != "<", M.b, -np.inf)
+            upper = np.where(M.sense != ">", M.b, np.inf)
+            h.addRows(num_cons, lower, upper, A.nnz, A.indptr, A.indices, A.data)
+
+        # Skip row/column names entirely to avoid large string allocations.
+        h.passModel(h.getLp())
+
+        Q = M.Q
+        if Q is not None:
+            Q = triu(Q)
+            Q = Q.tocsr()
+            num_vars = Q.shape[0]
+            h.passHessian(num_vars, Q.nnz, 1, Q.indptr, Q.indices, Q.data)
+
+        if m.objective.sense == "max":
+            h.changeObjectiveSense(highspy.ObjSense.kMaximize)
+
+        return h
+
+    linopy.io.to_highspy = _to_highspy_without_names
+    linopy.model.to_highspy = _to_highspy_without_names
+    linopy.model.Model.to_highspy = _to_highspy_without_names
+    linopy.io._pypsa_highspy_name_export_patched = True
+
 
 # Allow for PyPSA versions <0.35
 if PYPSA_V1:
@@ -289,6 +412,733 @@ def add_co2_sequestration_limit(
     )
 
 
+CDR_CREDIT_ORIGINS = ("dac", "biogenic", "fossil")
+CDR_INFRASTRUCTURE_PREFIXES = (
+    "co2 pipeline",
+    "co2 sequestered",
+    "co2 vent",
+    "co2 provenance",
+)
+BIOGENIC_TOKENS = ("biomass", "biogas", "biosng", "btl", "fuelwood", "msw", "bio")
+
+
+def _eligible_cdr_scopes(cdr_credit_scope: str | list[str]) -> set[str]:
+    if cdr_credit_scope == "all_sequestration":
+        return set(CDR_CREDIT_ORIGINS)
+    if isinstance(cdr_credit_scope, str):
+        scopes = {cdr_credit_scope}
+    else:
+        scopes = set(cdr_credit_scope)
+    scopes.discard("all_sequestration")
+    return scopes
+
+
+def _classify_co2_origin(carrier_name: str) -> str:
+    carrier = str(carrier_name).lower()
+    if "dac" in carrier:
+        return "dac"
+    if any(token in carrier for token in BIOGENIC_TOKENS):
+        return "biogenic"
+    return "fossil"
+
+
+def _get_cdr_credit_prices_for_period(
+    cdr_credit_price,
+    cdr_credit_scope: str | list[str],
+    cdr_credit_prices_by_scope,
+    planning_horizons: str | None,
+) -> dict[str, float]:
+    period = int(planning_horizons) if planning_horizons is not None else None
+    if cdr_credit_prices_by_scope:
+        return {
+            str(scope): float(get(traj, period))
+            for scope, traj in cdr_credit_prices_by_scope.items()
+            if float(get(traj, period)) != 0.0
+        }
+
+    base_price = float(get(cdr_credit_price, period))
+    if base_price == 0.0:
+        return {}
+
+    scopes = _eligible_cdr_scopes(cdr_credit_scope)
+    if not scopes:
+        return {}
+    return {scope: base_price for scope in scopes}
+
+
+def _co2_stored_buses(n: pypsa.Network) -> pd.Index:
+    return pd.Index(
+        n.buses.index[n.buses.carrier.astype(str).str.startswith("co2 stored")]
+    )
+
+
+def _capture_term_data(n: pypsa.Network) -> pd.DataFrame:
+    co2_stored_buses = set(_co2_stored_buses(n))
+    rows = []
+    for link_name in n.links.index:
+        carrier = str(n.links.at[link_name, "carrier"]).lower()
+        if carrier.startswith(CDR_INFRASTRUCTURE_PREFIXES):
+            continue
+
+        origin = _classify_co2_origin(n.links.at[link_name, "carrier"])
+        for idx in [1, 2, 3, 4]:
+            bus_col = f"bus{idx}"
+            eff_col = f"efficiency{idx}" if idx > 1 else "efficiency"
+            if bus_col in n.links.columns and eff_col in n.links.columns:
+                bus = n.links.at[link_name, bus_col]
+                eff = n.links.at[link_name, eff_col]
+                if pd.notna(bus) and pd.notna(eff):
+                    eff = float(eff)
+                    if bus in co2_stored_buses and eff > 0:
+                        rows.append(
+                            {
+                                "link": link_name,
+                                "bus": bus,
+                                "origin": origin,
+                                "coeff": eff,
+                            }
+                        )
+
+    if not rows:
+        return pd.DataFrame(columns=["link", "bus", "origin", "coeff"])
+    return pd.DataFrame(rows)
+
+
+def _capture_link_data(n: pypsa.Network) -> pd.DataFrame:
+    co2_stored_buses = set(_co2_stored_buses(n))
+    rows = []
+    for link_name in n.links.index:
+        carrier = str(n.links.at[link_name, "carrier"]).lower()
+        if carrier.startswith(CDR_INFRASTRUCTURE_PREFIXES):
+            continue
+        coeff = 0.0
+        atm_withdrawal = 0.0
+        for idx in [1, 2, 3, 4]:
+            bus_col = f"bus{idx}"
+            eff_col = f"efficiency{idx}" if idx > 1 else "efficiency"
+            if bus_col in n.links.columns and eff_col in n.links.columns:
+                bus = n.links.at[link_name, bus_col]
+                eff = n.links.at[link_name, eff_col]
+                if pd.notna(bus) and pd.notna(eff):
+                    if bus in co2_stored_buses and float(eff) > 0:
+                        coeff += float(eff)
+                    elif bus == "co2 atmosphere" and float(eff) < 0:
+                        atm_withdrawal += -float(eff)
+        if coeff > 0.0:
+            rows.append(
+                {
+                    "link": link_name,
+                    "origin": _classify_co2_origin(n.links.at[link_name, "carrier"]),
+                    "coeff": coeff,
+                    "atm_withdrawal": atm_withdrawal,
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def _withdrawal_term_data(n: pypsa.Network) -> pd.DataFrame:
+    co2_stored_buses = set(_co2_stored_buses(n))
+    rows = []
+    for link_name in n.links.index:
+        carrier = str(n.links.at[link_name, "carrier"]).lower()
+        if carrier.startswith(CDR_INFRASTRUCTURE_PREFIXES):
+            continue
+
+        for idx in [1, 2, 3, 4]:
+            bus_col = f"bus{idx}"
+            eff_col = f"efficiency{idx}" if idx > 1 else "efficiency"
+            if bus_col in n.links.columns and eff_col in n.links.columns:
+                bus = n.links.at[link_name, bus_col]
+                eff = n.links.at[link_name, eff_col]
+                if pd.notna(bus) and pd.notna(eff):
+                    eff = float(eff)
+                    if bus in co2_stored_buses and eff < 0:
+                        rows.append(
+                            {
+                                "term": f"co2_use_term_{len(rows)}",
+                                "link": link_name,
+                                "bus": bus,
+                                "coeff": -eff,
+                            }
+                        )
+
+    if not rows:
+        return pd.DataFrame(columns=["term", "link", "bus", "coeff"])
+    return pd.DataFrame(rows).set_index("term", drop=False)
+
+
+def _co2_pipeline_links(n: pypsa.Network) -> pd.Index:
+    return n.links.index[
+        n.links.carrier.astype(str).str.lower().str.startswith("co2 pipeline")
+    ]
+
+
+def _sequestration_links(n: pypsa.Network) -> pd.Index:
+    return n.links.index[n.links.carrier == "co2 sequestered"]
+
+
+def _vent_links(n: pypsa.Network) -> pd.Index:
+    return n.links.index[n.links.carrier == "co2 vent"]
+
+
+def _previous_snapshots(snapshot_index: pd.Index) -> pd.Index:
+    if snapshot_index.empty:
+        return snapshot_index
+
+    prev_positions = np.empty(len(snapshot_index), dtype=int)
+    if isinstance(snapshot_index, pd.MultiIndex):
+        if "period" in snapshot_index.names:
+            period_values = snapshot_index.get_level_values("period")
+        else:
+            period_values = snapshot_index.get_level_values(0)
+
+        for period in pd.Index(period_values).unique():
+            positions = np.flatnonzero(period_values == period)
+            prev_positions[positions] = np.roll(positions, 1)
+    else:
+        prev_positions[:] = np.roll(np.arange(len(snapshot_index)), 1)
+
+    return snapshot_index[prev_positions]
+
+
+def _link_term_timeseries(
+    link_p: xr.DataArray,
+    link_dim: str,
+    terms: pd.DataFrame,
+) -> xr.DataArray | float:
+    if terms.empty:
+        return 0.0
+
+    coeffs = terms.groupby("link")["coeff"].sum()
+    dispatch = link_p.sel({link_dim: coeffs.index.tolist()})
+    coeffs_da = xr.DataArray(
+        coeffs.to_numpy(),
+        dims=[link_dim],
+        coords={link_dim: coeffs.index.tolist()},
+    )
+    return (dispatch * coeffs_da).sum(link_dim)
+
+
+def _weighted_link_term_total(
+    link_p: xr.DataArray,
+    link_dim: str,
+    snap_dim: str,
+    snapshot_index: pd.Index,
+    snapshot_weightings: pd.Series,
+    terms: pd.DataFrame,
+) -> xr.DataArray | float:
+    if terms.empty:
+        return 0.0
+
+    coeffs = terms.groupby("link")["coeff"].sum()
+    dispatch = link_p.sel({link_dim: coeffs.index.tolist()})
+    coeffs_da = xr.DataArray(
+        np.outer(snapshot_weightings.to_numpy(), coeffs.to_numpy()),
+        dims=[snap_dim, link_dim],
+        coords={snap_dim: snapshot_index, link_dim: coeffs.index.tolist()},
+    )
+    return (dispatch * coeffs_da).sum()
+
+
+def _sanitize_constraint_key(value: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_]+", "_", str(value)).strip("_")
+
+
+def add_cdr_credit_accounting(
+    n: pypsa.Network,
+    planning_horizons: str | None,
+) -> None:
+    cdr_credit_timing = n.params.get("cdr_credit_timing", "capture")
+    if cdr_credit_timing != "sequestration" or planning_horizons is None:
+        return
+
+    cdr_credit_scope = n.params.get("cdr_credit_scope") or []
+    eligible_scopes = _eligible_cdr_scopes(cdr_credit_scope)
+    cdr_credit_standalone = bool(n.params.get("cdr_credit_standalone", False))
+    standalone_origins = {"dac", "biogenic"} if cdr_credit_standalone else set()
+    accounting_origins = eligible_scopes | standalone_origins
+
+    prices = _get_cdr_credit_prices_for_period(
+        cdr_credit_price=n.params.get("cdr_credit_price", 0.0),
+        cdr_credit_scope=cdr_credit_scope,
+        cdr_credit_prices_by_scope=n.params.get("cdr_credit_prices_by_scope", {}),
+        planning_horizons=planning_horizons,
+    )
+    cdr_credit_limit = n.params.get("cdr_credit_limit")
+    cdr_credit_limit_by_year = n.params.get("cdr_credit_limit_by_year")
+
+    # Provide explicit finite upper bounds so Gurobi's barrier doesn't treat
+    # these variables as free.  Unbounded CDR variables poison the homogeneous
+    # barrier on 2040+ brownfield models (infeasible_or_unbounded with code 4).
+    _limit_src = cdr_credit_limit_by_year or cdr_credit_limit
+    if _limit_src and planning_horizons:
+        nyears = n.snapshot_weightings.generators.sum() / 8760
+        _cdr_var_ub = get(_limit_src, int(planning_horizons)) * nyears * 1e6
+    else:
+        _cdr_var_ub = np.inf
+
+    needs_accounting = (
+        bool(prices)
+        or bool(cdr_credit_limit)
+        or bool(cdr_credit_limit_by_year)
+        or cdr_credit_standalone
+    )
+    if not needs_accounting or not accounting_origins:
+        return
+
+    capture = _capture_link_data(n)
+    relevant_capture = capture[capture.origin.isin(accounting_origins)]
+    eligible_capture = capture[capture.origin.isin(eligible_scopes)]
+    if relevant_capture.empty:
+        logger.info("add_cdr_credit_accounting: no relevant capture links found, skipping.")
+        return
+
+    capture_terms = _capture_term_data(n)
+    if capture_terms.empty:
+        logger.info("add_cdr_credit_accounting: no CO2 capture terms found, skipping.")
+        return
+
+    sequest_links = _sequestration_links(n)
+    if sequest_links.empty:
+        logger.info("add_cdr_credit_accounting: no physical sequestration links found, skipping.")
+        return
+
+    link_p = n.model["Link-p"]
+    snap_dim = link_p.dims[0]
+    link_dim = link_p.dims[1]
+    snapshot_index = link_p.coords[snap_dim].to_index()
+    generator_weightings = n.snapshot_weightings.generators.reindex(snapshot_index)
+    store_weightings = n.snapshot_weightings.stores.reindex(snapshot_index)
+
+    if generator_weightings.isna().any() or store_weightings.isna().any():
+        raise ValueError("Snapshot weightings could not be aligned with solver snapshots.")
+
+    credited_index = pd.Index(sorted(eligible_scopes), name="cdr_origin")
+    credited = None
+    if not credited_index.empty:
+        n.model.add_variables(0, _cdr_var_ub, coords=[credited_index], name="CDR-credited")
+        credited = n.model["CDR-credited"]
+
+    # -----------------------------------------------------------------------
+    # ANNUAL CDR SEQUESTRATION TRACKING
+    # Replaces per-snapshot CO2 origin inventory tracking (~1 M variables)
+    # with annual-level attribution variables (one scalar per accounting
+    # origin, typically 2: dac + biogenic).
+    #
+    # The per-snapshot approach caused Gurobi numerical trouble on 2040
+    # brownfield models (dual bound exceeds primal after ~170 barrier
+    # iterations).  Annual tracking preserves all economically relevant
+    # constraints:
+    #   - CDR credits <= annual sequestration attributed to eligible origin
+    #   - CDR credits <= annual capture by eligible origin
+    #   - total CDR attribution <= total physical annual sequestration
+    #   - ETS cancellation applied to DAC's annual attributed sequestration
+    # -----------------------------------------------------------------------
+
+    generator_weightings_da = xr.DataArray(
+        generator_weightings.to_numpy(),
+        dims=[snap_dim],
+        coords={snap_dim: snapshot_index},
+    )
+
+    # Annual total physical sequestration across all links (tCO2/yr)
+    annual_total_seq = (
+        link_p.sel({link_dim: sequest_links.tolist()}) * generator_weightings_da
+    ).sum()
+
+    accounting_index = pd.Index(sorted(accounting_origins), name="cdr_origin")
+    n.model.add_variables(
+        0,
+        _cdr_var_ub,
+        coords=[accounting_index],
+        name="CO2AnnualCDRSeq",
+    )
+    annual_cdr_seq = n.model["CO2AnnualCDRSeq"]
+
+    # Total CDR attribution <= total physical annual sequestration
+    n.model.add_constraints(
+        annual_cdr_seq.sum("cdr_origin") <= annual_total_seq,
+        name="cdr_annual_seq_total_limit",
+    )
+
+    # Per-origin attribution <= annual capture by that origin
+    for origin in sorted(accounting_origins):
+        origin_capture_terms = capture_terms[capture_terms.origin == origin]
+        if origin_capture_terms.empty:
+            n.model.add_constraints(
+                annual_cdr_seq.sel({"cdr_origin": origin}) <= 0.0,
+                name=f"cdr_annual_seq_capture_limit-{_sanitize_constraint_key(origin)}",
+            )
+        else:
+            annual_capture = _weighted_link_term_total(
+                link_p=link_p,
+                link_dim=link_dim,
+                snap_dim=snap_dim,
+                snapshot_index=snapshot_index,
+                snapshot_weightings=generator_weightings,
+                terms=origin_capture_terms,
+            )
+            n.model.add_constraints(
+                annual_cdr_seq.sel({"cdr_origin": origin}) <= annual_capture,
+                name=f"cdr_annual_seq_capture_limit-{_sanitize_constraint_key(origin)}",
+            )
+
+    # sequestered_by_origin: linopy variable per origin, used for CDR credit
+    # limits and ETS cancellation in the objective below.
+    sequestered_by_origin = {
+        origin: annual_cdr_seq.sel({"cdr_origin": origin})
+        for origin in accounting_origins
+    }
+
+    if credited is not None:
+        for origin in credited_index:
+            origin_capture = eligible_capture[eligible_capture.origin == origin]
+            if origin_capture.empty:
+                n.model.add_constraints(
+                    credited.loc[origin] <= 0.0,
+                    name=f"cdr_credited_capture_limit-{origin}",
+                )
+                continue
+            captured_expr = _weighted_link_term_total(
+                link_p=link_p,
+                link_dim=link_dim,
+                snap_dim=snap_dim,
+                snapshot_index=snapshot_index,
+                snapshot_weightings=generator_weightings,
+                terms=capture_terms[capture_terms.origin == origin],
+            )
+            n.model.add_constraints(
+                credited.loc[origin] <= captured_expr,
+                name=f"cdr_credited_capture_limit-{origin}",
+            )
+            n.model.add_constraints(
+                credited.loc[origin] <= sequestered_by_origin[origin],
+                name=f"cdr_credited_sequestration_limit-{origin}",
+            )
+
+    # Build objective adjustment: CDR credit revenue minus ETS cancellation for
+    # sequestered CO2 only.  Under standalone mode, DAC/BECCS should not earn
+    # both ETS and CDR credit.  By deferring the ETS cancellation to here (rather
+    # than as a fixed marginal cost at build time) we cancel ETS only for the
+    # CO2 that actually reaches geological sequestration.  CO2 diverted to CCU
+    # retains its ETS credit at capture and pays ETS at combustion, keeping
+    # that loop ETS-neutral.
+    objective_delta = None
+
+    if prices and credited is not None:
+        revenue = sum(
+            float(prices.get(origin, 0.0)) * credited.loc[origin]
+            for origin in credited_index
+        )
+        objective_delta = -revenue
+
+    # ETS cancellation for standalone DAC/BECCS is applied unconditionally at
+    # build time in prepare_sector_network.py (apply_cdr_credit_to_eligible_capture_links).
+    # Doing it there avoids the optimizer driving CO2AnnualCDRSeq to zero to dodge
+    # the net cost (ets_price - credit_price) when ets_price > credit_price.
+
+    if objective_delta is not None:
+        objective = n.model.objective.expression + objective_delta
+        n.model.add_objective(objective, overwrite=True, sense=n.model.objective.sense)
+
+
+def add_cdr_credit_limit(
+    n: pypsa.Network,
+    limit_dict: dict[str, float],
+    planning_horizons: str | None,
+    cdr_credit_scope: str | list[str],
+    cdr_credit_timing: str = "capture",
+) -> None:
+    """Add a constraint capping the total CDR credits issued per year (Mt CO2)."""
+    eligible_scopes = _eligible_cdr_scopes(cdr_credit_scope)
+    if not eligible_scopes:
+        return
+
+    nyears = n.snapshot_weightings.generators.sum() / 8760
+    limit = get(limit_dict, int(planning_horizons)) * nyears
+
+    if cdr_credit_timing == "sequestration":
+        if "CDR-credited" not in n.model.variables:
+            logger.info("add_cdr_credit_limit: credited CDR variables missing, skipping.")
+            return
+        credited = n.model["CDR-credited"]
+        lhs = credited.sum()
+        n.model.add_constraints(lhs <= limit * 1e6, name="cdr_credit_limit")
+        return
+
+    dim = "name" if PYPSA_V1 else "Link"
+    link_p = n.model["Link-p"]
+    weightings = n.snapshot_weightings.generators
+    snap_dim = link_p.dims[0]
+    snap_coords = link_p.coords[snap_dim].values
+
+    capture = _capture_link_data(n)
+    capture = capture[capture.origin.isin(eligible_scopes)]
+    if capture.empty:
+        logger.info("add_cdr_credit_limit: no eligible CDR links found, skipping.")
+        return
+
+    eligible_links = capture.link.tolist()
+    coeffs_da = xr.DataArray(
+        np.outer(weightings.values, capture.coeff.to_numpy()),
+        dims=[snap_dim, dim],
+        coords={snap_dim: snap_coords, dim: eligible_links},
+    )
+    lhs = (link_p.sel({dim: eligible_links}) * coeffs_da).sum()
+    n.model.add_constraints(lhs <= limit * 1e6, name="cdr_credit_limit")
+
+
+def _series_from_solution(
+    variable: linopy.variables.Variable | None,
+    model: linopy.Model | None = None,
+    name: str | None = None,
+) -> pd.Series:
+    solutions = []
+    if variable is not None:
+        for attr in ("solution", "sol"):
+            try:
+                solution = getattr(variable, attr, None)
+            except Exception as exc:
+                logger.debug("Could not read %s for variable %s: %s", attr, name, exc)
+                solution = None
+            if solution is not None:
+                solutions.append(solution)
+
+    if model is not None and name is not None:
+        try:
+            solution = getattr(model, "solution", None)
+            if solution is not None and name in solution:
+                solutions.append(solution[name])
+        except Exception as exc:
+            logger.debug("Could not read %s from model.solution: %s", name, exc)
+
+    for solution in solutions:
+        if hasattr(solution, "to_series"):
+            series = solution.to_series()
+        else:
+            series = pd.Series(solution)
+
+        if isinstance(series.index, pd.MultiIndex):
+            if len(series.index.names) == 1:
+                series.index = series.index.get_level_values(0)
+
+        series = pd.to_numeric(series, errors="coerce").dropna()
+        if not series.empty:
+            return series.astype(float)
+
+    return pd.Series(dtype=float)
+
+
+def _model_variable(n: pypsa.Network, name: str) -> linopy.variables.Variable | None:
+    if not hasattr(n, "model"):
+        return None
+    try:
+        return n.model[name]
+    except Exception:
+        return None
+
+
+def _annual_capture_proxy_by_origin(n: pypsa.Network) -> dict[str, float]:
+    capture = _capture_link_data(n)
+    if capture.empty:
+        return {origin: 0.0 for origin in CDR_CREDIT_ORIGINS}
+
+    weights = n.snapshot_weightings.generators
+    out = {origin: 0.0 for origin in CDR_CREDIT_ORIGINS}
+
+    for origin in out:
+        origin_capture = capture[capture.origin == origin]
+        if origin_capture.empty:
+            continue
+        coeffs = origin_capture.groupby("link")["coeff"].sum()
+        dispatch = n.links_t.p0[coeffs.index]
+        weighted = dispatch.mul(weights, axis=0).mul(coeffs, axis=1)
+        out[origin] = float(weighted.to_numpy().sum())
+
+    return out
+
+
+def _annual_physical_sequestration(n: pypsa.Network) -> float:
+    links = _sequestration_links(n)
+    if links.empty:
+        return 0.0
+
+    weights = n.snapshot_weightings.generators
+    dispatch = n.links_t.p0[links]
+    return float(dispatch.mul(weights, axis=0).to_numpy().sum())
+
+
+def export_cdr_credit_accounting(
+    n: pypsa.Network,
+    output_path: str | Path,
+    planning_horizons: str | None,
+) -> None:
+    period = int(planning_horizons) if planning_horizons is not None else None
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    prices = _get_cdr_credit_prices_for_period(
+        cdr_credit_price=n.params.get("cdr_credit_price", 0.0),
+        cdr_credit_scope=n.params.get("cdr_credit_scope") or [],
+        cdr_credit_prices_by_scope=n.params.get("cdr_credit_prices_by_scope", {}),
+        planning_horizons=planning_horizons,
+    )
+    eligible_scopes = sorted(_eligible_cdr_scopes(n.params.get("cdr_credit_scope") or []))
+    limit_dict = n.params.get("cdr_credit_limit_by_year") or n.params.get("cdr_credit_limit")
+    credit_limit_mt = float(get(limit_dict, period)) if (limit_dict and period is not None) else np.nan
+
+    capture_proxy = _annual_capture_proxy_by_origin(n)
+    physical_seq_t = _annual_physical_sequestration(n)
+
+    model = getattr(n, "model", None)
+    credited_series = _series_from_solution(
+        _model_variable(n, "CDR-credited"),
+        model=model,
+        name="CDR-credited",
+    )
+    attributed_series = _series_from_solution(
+        _model_variable(n, "CO2AnnualCDRSeq"),
+        model=model,
+        name="CO2AnnualCDRSeq",
+    )
+
+    use_solver_export = not credited_series.empty
+    cdr_credit_timing = n.params.get("cdr_credit_timing", "capture")
+    needs_sequestration_accounting = (
+        cdr_credit_timing == "sequestration"
+        and bool(eligible_scopes)
+        and (
+            bool(prices)
+            or bool(n.params.get("cdr_credit_limit"))
+            or bool(n.params.get("cdr_credit_limit_by_year"))
+            or bool(n.params.get("cdr_credit_standalone", False))
+        )
+    )
+
+    solver_values_missing = needs_sequestration_accounting and (
+        credited_series.empty or attributed_series.empty
+    )
+    if solver_values_missing:
+        logger.warning(
+            "CDR accounting is configured for sequestration timing, but solver "
+            "values for CDR-credited/CO2AnnualCDRSeq are unavailable. Exporting "
+            "the solved network and a flagged accounting row without credit values."
+        )
+
+    def _mt(series: pd.Series, key: str) -> float:
+        if key not in series.index:
+            return 0.0
+        return float(series.loc[key]) / 1e6
+
+    if solver_values_missing:
+        credited_dac_mt = np.nan
+        credited_biogenic_mt = np.nan
+        method = "solver_unavailable"
+    elif use_solver_export:
+        credited_dac_mt = _mt(credited_series, "dac")
+        credited_biogenic_mt = _mt(credited_series, "biogenic")
+        method = "solver_export"
+    else:
+        credited_dac_mt = capture_proxy["dac"] / 1e6
+        credited_biogenic_mt = capture_proxy["biogenic"] / 1e6
+        method = "capture_proxy"
+
+    row = {
+        "planning_horizon": period,
+        "cdr_credit_timing": cdr_credit_timing,
+        "cdr_credit_standalone": bool(n.params.get("cdr_credit_standalone", False)),
+        "method": method,
+        "accounting_error": (
+            "missing_solver_values_for_CDR-credited_or_CO2AnnualCDRSeq"
+            if solver_values_missing
+            else ""
+        ),
+        "eligible_scopes": ",".join(eligible_scopes),
+        "price_dac_eur_per_tco2": float(prices.get("dac", 0.0)),
+        "price_biogenic_eur_per_tco2": float(prices.get("biogenic", 0.0)),
+        "credit_limit_mtco2_per_yr": credit_limit_mt,
+        "credited_dac_mtco2_per_yr": credited_dac_mt,
+        "credited_biogenic_mtco2_per_yr": credited_biogenic_mt,
+        "credited_total_mtco2_per_yr": credited_dac_mt + credited_biogenic_mt,
+        "attributed_dac_mtco2_per_yr": _mt(attributed_series, "dac"),
+        "attributed_biogenic_mtco2_per_yr": _mt(attributed_series, "biogenic"),
+        "attributed_total_mtco2_per_yr": (
+            (_mt(attributed_series, "dac") + _mt(attributed_series, "biogenic"))
+            if not attributed_series.empty
+            else np.nan
+        ),
+        "capture_proxy_dac_mtco2_per_yr": capture_proxy["dac"] / 1e6,
+        "capture_proxy_biogenic_mtco2_per_yr": capture_proxy["biogenic"] / 1e6,
+        "capture_proxy_total_mtco2_per_yr": (
+            capture_proxy["dac"] + capture_proxy["biogenic"]
+        )
+        / 1e6,
+        "physical_sequestration_mtco2_per_yr": physical_seq_t / 1e6,
+    }
+    tolerance_mt = 1e-3
+    credited_total = row["credited_total_mtco2_per_yr"]
+    attributed_total = row["attributed_total_mtco2_per_yr"]
+    physical_seq_mt = row["physical_sequestration_mtco2_per_yr"]
+    capture_proxy_total = row["capture_proxy_total_mtco2_per_yr"]
+
+    row["valid_credited_within_limit"] = False if solver_values_missing else (
+        True
+        if np.isnan(credit_limit_mt)
+        else credited_total <= credit_limit_mt + tolerance_mt
+    )
+    row["valid_credited_within_capture_proxy"] = (
+        False
+        if solver_values_missing
+        else credited_total <= capture_proxy_total + tolerance_mt
+    )
+    row["valid_credited_within_attributed"] = (
+        False
+        if np.isnan(attributed_total)
+        else credited_total <= attributed_total + tolerance_mt
+    )
+    row["valid_attributed_within_physical_sequestration"] = (
+        False
+        if np.isnan(attributed_total)
+        else attributed_total <= physical_seq_mt + tolerance_mt
+    )
+
+    pd.DataFrame([row]).to_csv(output_path, index=False)
+    logger.info("Exported CDR credit accounting to %s", output_path.resolve())
+
+
+def export_cdr_credit_accounting_failure(
+    n: pypsa.Network,
+    output_path: str | Path,
+    planning_horizons: str | None,
+    error: Exception,
+) -> None:
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(
+        [
+            {
+                "planning_horizon": (
+                    int(planning_horizons) if planning_horizons is not None else np.nan
+                ),
+                "cdr_credit_timing": n.params.get("cdr_credit_timing", "capture"),
+                "cdr_credit_standalone": bool(
+                    n.params.get("cdr_credit_standalone", False)
+                ),
+                "method": "export_failed",
+                "accounting_error": str(error),
+                "valid_credited_within_limit": False,
+                "valid_credited_within_capture_proxy": False,
+                "valid_credited_within_attributed": False,
+                "valid_attributed_within_physical_sequestration": False,
+            }
+        ]
+    ).to_csv(output_path, index=False)
+    logger.warning(
+        "Exported flagged CDR credit accounting failure row to %s",
+        output_path.resolve(),
+    )
+
+
 def add_carbon_constraint(n: pypsa.Network, snapshots: pd.DatetimeIndex) -> None:
     glcs = n.global_constraints.query('type == "co2_atmosphere"')
     if glcs.empty:
@@ -362,6 +1212,136 @@ def add_max_growth(n: pypsa.Network, opts: dict) -> None:
             f"set maximum relative growth per investment period of {carrier} to {max_r_per_period}."
         )
         n.carriers.loc[carrier, "max_relative_growth"] = max_r_per_period
+
+
+def _myopic_period_years(n: pypsa.Network, planning_horizons: str) -> int:
+    horizons = sorted(
+        int(year)
+        for year in n.config.get("scenario", {}).get("planning_horizons", [])
+    )
+    period = int(planning_horizons)
+
+    if period in horizons:
+        index = horizons.index(period)
+        if index > 0:
+            return period - horizons[index - 1]
+        if len(horizons) > 1:
+            return horizons[1] - horizons[0]
+
+    return 10
+
+
+def add_max_growth_myopic(
+    n: pypsa.Network, opts: dict, planning_horizons: str
+) -> None:
+    """
+    Apply per-carrier maximum growth constraints for myopic optimisation.
+
+    The perfect-foresight version (add_max_growth) sets n.carriers.max_growth
+    which PyPSA enforces automatically via investment_period_weightings.  In
+    myopic mode investment_period_weightings is empty, so those carrier
+    attributes are never applied.  This function adds equivalent explicit
+    linopy constraints:
+
+        sum(p_nom_opt) <= existing_mw + rate_GW_yr * period_years * factor
+
+    and, when max_relative_growth is configured:
+
+        sum(extendable p_nom_opt) <= max_relative * brownfield_mw
+
+    where brownfield_mw is the non-extendable (already-built) fleet inherited
+    from the previous horizon.  The relative constraint is skipped when the
+    brownfield fleet is zero to avoid forcing new-technology deployment to zero.
+    """
+    if not opts.get("enable", False):
+        return
+
+    period_years = _myopic_period_years(n, planning_horizons)
+    factor = period_years * opts["factor"]
+
+    for carrier, rate_gw_yr in opts["max_growth"].items():
+        max_new_mw = rate_gw_yr * factor * 1e3  # GW/yr to MW
+
+        gen_i = n.generators.index[
+            (n.generators.carrier == carrier) & n.generators.p_nom_extendable
+        ]
+        link_i = n.links.index[
+            (n.links.carrier == carrier) & n.links.p_nom_extendable
+        ]
+
+        if gen_i.empty and link_i.empty:
+            logger.debug(
+                "max_growth_myopic: no extendable components for %s, skipping.",
+                carrier,
+            )
+            continue
+
+        existing_mw = n.generators.loc[gen_i, "p_nom"].sum() + n.links.loc[link_i, "p_nom"].sum()
+        cap_mw = existing_mw + max_new_mw
+
+        lhs_parts = []
+        if not gen_i.empty:
+            lhs_parts.append(n.model["Generator-p_nom"].loc[gen_i].sum())
+        if not link_i.empty:
+            lhs_parts.append(n.model["Link-p_nom"].loc[link_i].sum())
+        lhs = lhs_parts[0] if len(lhs_parts) == 1 else sum(lhs_parts[1:], lhs_parts[0])
+
+        key = _sanitize_constraint_key(carrier)
+        n.model.add_constraints(lhs <= cap_mw, name=f"max_growth_myopic_{key}")
+        logger.info(
+            f"max_growth_myopic: {carrier} total cap = {cap_mw/1e3:.0f} GW "
+            f"(existing {existing_mw/1e3:.0f} GW + new <= {max_new_mw/1e3:.0f} GW "
+            f"= {rate_gw_yr} GW/yr x {period_years} yr x {opts['factor']})"
+        )
+
+    for carrier, max_relative in opts.get("max_relative_growth", {}).items():
+        gen_ext_i = n.generators.index[
+            (n.generators.carrier == carrier) & n.generators.p_nom_extendable
+        ]
+        link_ext_i = n.links.index[
+            (n.links.carrier == carrier) & n.links.p_nom_extendable
+        ]
+
+        if gen_ext_i.empty and link_ext_i.empty:
+            logger.debug(
+                "max_growth_myopic (relative): no extendable components for %s, skipping.",
+                carrier,
+            )
+            continue
+
+        gen_fixed_i = n.generators.index[
+            (n.generators.carrier == carrier) & ~n.generators.p_nom_extendable
+        ]
+        link_fixed_i = n.links.index[
+            (n.links.carrier == carrier) & ~n.links.p_nom_extendable
+        ]
+        brownfield_mw = n.generators.loc[gen_fixed_i, "p_nom"].sum() + n.links.loc[
+            link_fixed_i, "p_nom"
+        ].sum()
+
+        if brownfield_mw == 0:
+            logger.debug(
+                "max_growth_myopic (relative): brownfield fleet for %s is zero, skipping "
+                "relative cap to avoid forcing new technology to zero.",
+                carrier,
+            )
+            continue
+
+        cap_mw = max_relative * brownfield_mw
+
+        lhs_parts = []
+        if not gen_ext_i.empty:
+            lhs_parts.append(n.model["Generator-p_nom"].loc[gen_ext_i].sum())
+        if not link_ext_i.empty:
+            lhs_parts.append(n.model["Link-p_nom"].loc[link_ext_i].sum())
+        lhs = lhs_parts[0] if len(lhs_parts) == 1 else sum(lhs_parts[1:], lhs_parts[0])
+
+        key = _sanitize_constraint_key(carrier)
+        n.model.add_constraints(lhs <= cap_mw, name=f"max_growth_myopic_{key}_relative")
+        logger.info(
+            f"max_growth_myopic (relative): {carrier} new cap <= {cap_mw/1e3:.0f} GW "
+            f"({max_relative}x brownfield {brownfield_mw/1e3:.0f} GW)"
+        )
 
 
 def add_retrofit_gas_boiler_constraint(
@@ -494,6 +1474,8 @@ def prepare_network(
         )
 
     if solve_opts.get("noisy_costs"):
+        transmission_reference_before = _transmission_expansion_cost_reference(n)
+
         for t in n.iterate_components():
             # if 'capital_cost' in t.df:
             #    t.df['capital_cost'] += 1e1 + 2.*(np.random.random(len(t.df)) - 0.5)
@@ -506,6 +1488,11 @@ def prepare_network(
             t.df["capital_cost"] += (
                 1e-1 + 2e-2 * (np.random.random(len(t.df)) - 0.5)
             ) * t.df["length"]
+
+        _rescale_transmission_expansion_cost_limits(
+            n, transmission_reference_before
+        )
+        disable_grid_expansion_if_limit_hit(n)
 
     if solve_opts.get("nhours"):
         nhours = solve_opts["nhours"]
@@ -525,7 +1512,6 @@ def prepare_network(
         add_co2_sequestration_limit(
             n, limit_dict=limit_dict, planning_horizons=planning_horizons
         )
-
 
 def add_CCL_constraints(
     n: pypsa.Network, config: dict, planning_horizons: str | None
@@ -1139,6 +2125,277 @@ def add_import_limit_constraint(n: pypsa.Network, sns: pd.DatetimeIndex):
     n.model.add_constraints(lhs, limit_sense, rhs, name="import_limit")
 
 
+def _get_diagnostic_slack_config(config: dict) -> dict:
+    solving = config.get("solving", {})
+    options = solving.get("options", {})
+    slack_config = options.get("diagnostic_slacks", {})
+    if not slack_config:
+        slack_config = solving.get("diagnostic_slacks", {})
+
+    if isinstance(slack_config, bool):
+        slack_config = {"enable": slack_config}
+
+    return slack_config or {}
+
+
+def _diagnostic_slacks_enabled(config: dict) -> bool:
+    return bool(_get_diagnostic_slack_config(config).get("enable", False))
+
+
+def _compile_diagnostic_slack_patterns(slack_config: dict) -> list[re.Pattern]:
+    patterns = list(slack_config.get("constraint_patterns", []))
+    groups = slack_config.get("groups")
+
+    if groups is None:
+        groups = list(DEFAULT_DIAGNOSTIC_SLACK_PATTERNS)
+    elif isinstance(groups, str):
+        groups = [groups]
+
+    for group in groups:
+        patterns.extend(DEFAULT_DIAGNOSTIC_SLACK_PATTERNS.get(group, []))
+
+    include_names = slack_config.get("constraint_names", [])
+    if isinstance(include_names, str):
+        include_names = [include_names]
+    patterns.extend(f"^{re.escape(name)}$" for name in include_names)
+
+    return [re.compile(pattern, re.IGNORECASE) for pattern in patterns]
+
+
+def _constraint_coords(constraint: linopy.constraints.Constraint) -> dict:
+    return {
+        dim: constraint.coords[dim]
+        for dim in constraint.sign.dims
+        if dim in constraint.coords
+    }
+
+
+def _add_diagnostic_slack_variable(
+    model: linopy.Model,
+    name: str,
+    coords: dict,
+    mask: xr.DataArray | None,
+) -> linopy.variables.Variable:
+    if not coords:
+        return model.add_variables(lower=0, name=name)
+
+    coord_dims = set(coords)
+    if mask is not None and not set(mask.dims).issubset(coord_dims):
+        mask = None
+
+    dims = list(coords)
+    lower = xr.DataArray(0.0, coords=coords, dims=dims)
+    return model.add_variables(
+        lower=lower,
+        mask=mask,
+        name=name,
+    )
+
+
+def add_diagnostic_slacks(n: pypsa.Network) -> None:
+    """
+    Relax selected constraints with expensive non-negative slacks.
+
+    This is a diagnostic tool for infeasible models. It should be enabled only
+    for targeted runs via ``solving.options.diagnostic_slacks.enable``. The
+    slacks are penalised in the objective and later exported so the binding
+    source of infeasibility can be identified.
+    """
+    slack_config = _get_diagnostic_slack_config(n.config)
+    if not slack_config.get("enable", False):
+        return
+
+    patterns = _compile_diagnostic_slack_patterns(slack_config)
+    if not patterns:
+        logger.warning("Diagnostic slacks enabled but no constraint patterns configured.")
+        return
+
+    penalty = float(slack_config.get("penalty", 1e9))
+    model = n.model
+    slack_specs = []
+    objective_delta = None
+
+    def add_to_objective(expr):
+        nonlocal objective_delta
+        objective_delta = expr if objective_delta is None else objective_delta + expr
+
+    for name in list(model.constraints.data):
+        if name.startswith("diagnostic_slack"):
+            continue
+        if not any(pattern.search(name) for pattern in patterns):
+            continue
+
+        constraint = model.constraints[name]
+        sign_values = np.asarray(constraint.sign.values).reshape(-1)
+        signs = pd.unique(pd.Series(sign_values).dropna().astype(str))
+        if len(signs) != 1:
+            logger.warning(
+                "Skipping diagnostic slack for mixed-sign constraint block %s: %s",
+                name,
+                signs,
+            )
+            continue
+
+        sign = signs[0]
+        lhs = constraint.lhs
+        rhs = constraint.rhs
+        coords = _constraint_coords(constraint)
+        mask = constraint.mask
+        key = _sanitize_constraint_key(name)
+
+        if sign in ("<=", "<", "≤"):
+            slack_name = f"diagnostic_slack__{key}"
+            slack = _add_diagnostic_slack_variable(
+                model, name=slack_name, coords=coords, mask=mask
+            )
+            relaxed = lhs - slack <= rhs
+            model.constraints.remove(name)
+            model.add_constraints(relaxed, name=name)
+            add_to_objective(penalty * slack.sum())
+            slack_specs.append(
+                {"constraint": name, "variable": slack_name, "direction": "upper"}
+            )
+
+        elif sign in (">=", ">", "≥"):
+            slack_name = f"diagnostic_slack__{key}"
+            slack = _add_diagnostic_slack_variable(
+                model, name=slack_name, coords=coords, mask=mask
+            )
+            relaxed = lhs + slack >= rhs
+            model.constraints.remove(name)
+            model.add_constraints(relaxed, name=name)
+            add_to_objective(penalty * slack.sum())
+            slack_specs.append(
+                {"constraint": name, "variable": slack_name, "direction": "lower"}
+            )
+
+        elif sign in ("=", "=="):
+            slack_pos_name = f"diagnostic_slack_pos__{key}"
+            slack_neg_name = f"diagnostic_slack_neg__{key}"
+            slack_pos = _add_diagnostic_slack_variable(
+                model, name=slack_pos_name, coords=coords, mask=mask
+            )
+            slack_neg = _add_diagnostic_slack_variable(
+                model, name=slack_neg_name, coords=coords, mask=mask
+            )
+            relaxed = lhs + slack_pos - slack_neg == rhs
+            model.constraints.remove(name)
+            model.add_constraints(relaxed, name=name)
+            add_to_objective(penalty * (slack_pos.sum() + slack_neg.sum()))
+            slack_specs.extend(
+                [
+                    {
+                        "constraint": name,
+                        "variable": slack_pos_name,
+                        "direction": "positive",
+                    },
+                    {
+                        "constraint": name,
+                        "variable": slack_neg_name,
+                        "direction": "negative",
+                    },
+                ]
+            )
+
+        else:
+            logger.warning(
+                "Skipping diagnostic slack for constraint block %s with sign %s",
+                name,
+                sign,
+            )
+
+    if not slack_specs:
+        logger.warning("Diagnostic slacks enabled but no matching constraints found.")
+        return
+
+    model.add_objective(
+        model.objective.expression + objective_delta,
+        overwrite=True,
+        sense=model.objective.sense,
+    )
+    n._diagnostic_slack_specs = slack_specs
+    logger.warning(
+        "Added %s diagnostic slack variable blocks with objective penalty %.3g.",
+        len(slack_specs),
+        penalty,
+    )
+
+
+def export_diagnostic_slacks(
+    n: pypsa.Network, solver_log: str | os.PathLike | None, tolerance: float = 1e-6
+) -> None:
+    specs = getattr(n, "_diagnostic_slack_specs", [])
+    if not specs or solver_log is None:
+        return
+
+    solver_log = Path(solver_log)
+    stem = solver_log.stem
+    if stem.endswith("_solver"):
+        stem = stem[: -len("_solver")]
+    detail_path = solver_log.with_name(f"{stem}_diagnostic_slacks.csv")
+    summary_path = solver_log.with_name(f"{stem}_diagnostic_slacks_summary.csv")
+
+    rows = []
+    summary_rows = []
+    for spec in specs:
+        try:
+            solution = n.model[spec["variable"]].solution
+            if solution.ndim == 0:
+                frame = pd.DataFrame({"value": [float(solution.values)]})
+            else:
+                frame = solution.to_dataframe(name="value").reset_index()
+        except Exception as exc:  # pragma: no cover - diagnostic fallback
+            logger.warning(
+                "Could not export diagnostic slack variable %s: %s",
+                spec["variable"],
+                exc,
+            )
+            continue
+
+        if "value" not in frame:
+            continue
+        frame = frame.dropna(subset=["value"])
+        nonzero = frame[frame["value"].abs() > tolerance].copy()
+
+        summary_rows.append(
+            {
+                "constraint": spec["constraint"],
+                "variable": spec["variable"],
+                "direction": spec["direction"],
+                "nonzero_count": int(len(nonzero)),
+                "total_slack": float(nonzero["value"].abs().sum()),
+                "max_slack": float(nonzero["value"].abs().max())
+                if not nonzero.empty
+                else 0.0,
+            }
+        )
+
+        for _, row in nonzero.iterrows():
+            coord_values = {
+                column: row[column]
+                for column in nonzero.columns
+                if column != "value"
+            }
+            rows.append(
+                {
+                    "constraint": spec["constraint"],
+                    "variable": spec["variable"],
+                    "direction": spec["direction"],
+                    "value": float(row["value"]),
+                    **coord_values,
+                }
+            )
+
+    pd.DataFrame(rows).to_csv(detail_path, index=False)
+    summary = pd.DataFrame(summary_rows)
+    if not summary.empty:
+        summary = summary.sort_values(["total_slack", "max_slack"], ascending=False)
+    summary.to_csv(summary_path, index=False)
+    logger.warning(
+        "Wrote diagnostic slack reports to %s and %s", detail_path, summary_path
+    )
+
+
 def add_co2_atmosphere_constraint(n, snapshots):
     glcs = n.global_constraints[n.global_constraints.type == "co2_atmosphere"]
 
@@ -1207,6 +2464,15 @@ def extra_functionality(
     ):
         add_solar_potential_constraints(n, config)
 
+    limit_max_growth = config.get("sector", {}).get("limit_max_growth")
+    if (
+        not n._multi_invest
+        and planning_horizons
+        and limit_max_growth is not None
+        and limit_max_growth.get("enable", False)
+    ):
+        add_max_growth_myopic(n, limit_max_growth, planning_horizons)
+
     if n.config.get("sector", {}).get("tes", False):
         if n.buses.index.str.contains(
             r"urban central heat|urban decentral heat|rural heat",
@@ -1232,6 +2498,22 @@ def extra_functionality(
     if config["sector"]["imports"]["enable"]:
         add_import_limit_constraint(n, snapshots)
 
+    add_cdr_credit_accounting(n, planning_horizons)
+
+    cdr_credit_limit = n.params.get("cdr_credit_limit")
+    cdr_credit_limit_by_year = n.params.get("cdr_credit_limit_by_year")
+    cdr_credit_scope = n.params.get("cdr_credit_scope") or []
+    cdr_credit_timing = n.params.get("cdr_credit_timing", "capture")
+    credit_limit = cdr_credit_limit_by_year or cdr_credit_limit
+    if credit_limit and planning_horizons:
+        add_cdr_credit_limit(
+            n,
+            limit_dict=credit_limit,
+            planning_horizons=planning_horizons,
+            cdr_credit_scope=cdr_credit_scope,
+            cdr_credit_timing=cdr_credit_timing,
+        )
+
     if n.params.custom_extra_functionality:
         source_path = n.params.custom_extra_functionality
         assert os.path.exists(source_path), f"{source_path} does not exist"
@@ -1240,6 +2522,8 @@ def extra_functionality(
         module = importlib.import_module(module_name)
         custom_extra_functionality = getattr(module, module_name)
         custom_extra_functionality(n, snapshots, snakemake)  # pylint: disable=E0601
+
+    add_diagnostic_slacks(n)
 
 
 def check_objective_value(n: pypsa.Network, solving: dict) -> None:
@@ -1318,11 +2602,19 @@ def collect_kwargs(
     solver_name = solving["solver"]["name"]
     solver_options = solving["solver_options"][set_of_options] if set_of_options else {}
 
+    io_api = cf_solving.get("io_api", None)
+    if io_api is None and solver_name == "gurobi":
+        logger.info("No io_api configured; defaulting to Gurobi MPS interface.")
+        io_api = "mps"
+
+    if io_api == "mps":
+        patch_linopy_highspy_name_export()
+
     solve_kwargs = {}
     solve_kwargs["solver_name"] = solver_name
     solve_kwargs["solver_options"] = solver_options
     solve_kwargs["assign_all_duals"] = cf_solving.get("assign_all_duals", False)
-    solve_kwargs["io_api"] = cf_solving.get("io_api", None)
+    solve_kwargs["io_api"] = io_api
     solve_kwargs["keep_files"] = cf_solving.get("keep_files", False)
 
     if log_fn:
@@ -1520,7 +2812,21 @@ if __name__ == "__main__":
 
     logger.info(f"Maximum memory usage: {mem.mem_usage}")
 
+    if _diagnostic_slacks_enabled(snakemake.config):
+        export_diagnostic_slacks(
+            n,
+            solver_log=getattr(snakemake.log, "solver", None),
+            tolerance=float(
+                _get_diagnostic_slack_config(snakemake.config).get("tolerance", 1e-6)
+            ),
+        )
+        raise RuntimeError(
+            "Diagnostic slack run completed; not exporting relaxed solution as "
+            "a solved network."
+        )
+
     # Check results
+    condition_str = str(condition).lower()
     if not rolling_horizon:
         if status != "ok":
             logger.warning(
@@ -1528,14 +2834,20 @@ if __name__ == "__main__":
             )
         check_objective_value(n, snakemake.params.solving)
 
-    if "warning" in condition:
-        raise RuntimeError("Solving status 'warning'. Discarding solution.")
-
-    if "infeasible" in condition:
+    if "infeasible" in condition_str:
         labels = n.model.compute_infeasibilities()
         logger.info(f"Labels:\n{labels}")
         n.model.print_infeasibilities()
         raise RuntimeError("Solving status 'infeasible'. Infeasibilities computed.")
+
+    if status != "ok":
+        raise RuntimeError(
+            f"Solving failed with status '{status}' and termination condition "
+            f"'{condition}'. Discarding solution and skipping exports."
+        )
+
+    if "warning" in condition_str:
+        raise RuntimeError("Solving status 'warning'. Discarding solution.")
 
     n.meta = dict(snakemake.config, **dict(wildcards=dict(snakemake.wildcards)))
     n.export_to_netcdf(snakemake.output.network)
@@ -1548,3 +2860,19 @@ if __name__ == "__main__":
             allow_unicode=True,
             sort_keys=False,
         )
+
+    if hasattr(snakemake.output, "cdr_credit_accounting"):
+        try:
+            export_cdr_credit_accounting(
+                n,
+                output_path=snakemake.output.cdr_credit_accounting,
+                planning_horizons=planning_horizons,
+            )
+        except Exception as exc:
+            logger.exception("Failed to export CDR credit accounting.")
+            export_cdr_credit_accounting_failure(
+                n,
+                output_path=snakemake.output.cdr_credit_accounting,
+                planning_horizons=planning_horizons,
+                error=exc,
+            )

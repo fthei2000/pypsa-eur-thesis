@@ -5,8 +5,11 @@
 Create static energy balance maps for the defined carriers using`n.plot()`.
 """
 
+import logging
+
 import geopandas as gpd
 import matplotlib.pyplot as plt
+import numpy as np
 import pandas as pd
 import pypsa
 from packaging.version import Version, parse
@@ -23,6 +26,24 @@ from scripts.add_electricity import sanitize_carriers
 from scripts.plot_power_network import load_projection
 
 SEMICIRCLE_CORRECTION_FACTOR = 2 if parse(pypsa.__version__) <= Version("0.33.2") else 1
+logger = logging.getLogger(__name__)
+
+
+def sanitize_numeric(series: pd.Series | None, label: str) -> pd.Series | None:
+    if series is None:
+        return None
+
+    invalid = ~np.isfinite(series)
+    if invalid.any():
+        logger.warning(
+            "Replacing %s non-finite values in %s with 0 for plotting.",
+            int(invalid.sum()),
+            label,
+        )
+        series = series.where(~invalid, 0.0)
+
+    return series
+
 
 if __name__ == "__main__":
     if "snakemake" not in globals():
@@ -92,8 +113,14 @@ if __name__ == "__main__":
 
     # only carriers that are also in the energy balance
     carriers_in_eb = carriers[carriers.isin(eb.index.get_level_values("carrier"))]
+    components_in_eb = components[components.isin(eb.index.get_level_values("component"))]
 
-    eb.loc[components] = eb.loc[components].drop(index=carriers_in_eb, level="carrier")
+    if len(components_in_eb) and len(carriers_in_eb):
+        eb.loc[components_in_eb] = eb.loc[components_in_eb].drop(
+            index=carriers_in_eb,
+            level="carrier",
+            errors="ignore",
+        )
     eb = eb.dropna()
     bus_sizes = eb.groupby(level=["bus", "carrier"]).sum().div(unit_conversion)
     bus_sizes = bus_sizes.sort_values(ascending=False)
@@ -120,6 +147,7 @@ if __name__ == "__main__":
             lambda x: x.replace("-reversed", "")
         )
         flow = flow[~flow_reversed_mask].subtract(flow_reversed, fill_value=0)
+        flow = sanitize_numeric(flow, "transmission flows")
 
     # if there are not lines or links for the bus carrier, use fallback for plotting
     fallback = pd.Series()
@@ -134,16 +162,24 @@ if __name__ == "__main__":
     # get prices per region as colormap
     buses = n.buses.query("carrier in @carrier").index
     weights = n.snapshot_weightings.generators
-    prices = weights @ n.buses_t.marginal_price[buses] / weights.sum()
-    level = "name" if PYPSA_V1 else "Bus"
-    price = prices.rename(n.buses.location).groupby(level=level).mean()
+    marginal_prices = n.buses_t.marginal_price.reindex(columns=buses)
+
+    if marginal_prices.empty:
+        price = pd.Series(dtype=float)
+    else:
+        prices = weights @ marginal_prices / weights.sum()
+        level = "name" if PYPSA_V1 else "Bus"
+        price = prices.rename(n.buses.location).groupby(level=level).mean()
 
     if carrier == "co2 stored" and "CO2Limit" in n.global_constraints.index:
         co2_price = n.global_constraints.loc["CO2Limit", "mu"]
         price = price - co2_price
 
     # if only one price is available, use this price for all regions
-    if price.size == 1:
+    if price.empty:
+        regions["price"] = 0.0
+        shift = 0
+    elif price.size == 1:
         regions["price"] = price.values[0]
         shift = round(abs(price.values[0]) / 20, 0)
     else:

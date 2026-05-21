@@ -198,6 +198,18 @@ def solved_previous_horizon(w):
     i = planning_horizons.index(int(w.planning_horizons))
     planning_horizon_p = str(planning_horizons[i - 1])
 
+    # If brownfield_from is set and this is the first transition (baseyear → next),
+    # use the solved network from a shared reference run (e.g. S0 baseline).
+    brownfield_from = config_provider("run", "brownfield_from", default=None)(w)
+    if brownfield_from and i == 1:
+        return (
+            "results/"
+            + brownfield_from
+            + "/networks/base_s_{clusters}_{opts}_{sector_opts}_"
+            + planning_horizon_p
+            + ".nc"
+        )
+
     return (
         RESULTS
         + "networks/base_s_{clusters}_{opts}_{sector_opts}_"

@@ -82,7 +82,16 @@ def build_existing_heating():
     # distribute technologies to nodes by population
     pop_layout = pd.read_csv(snakemake.input.clustered_pop_layout, index_col=0)
 
-    nodal_heating = existing_heating.loc[pop_layout.ct]
+    missing_countries = pd.Index(pop_layout.ct.unique()).difference(existing_heating.index)
+    if not missing_countries.empty:
+        logger.warning(
+            "Missing existing heating data for countries %s. Falling back to 0 capacity.",
+            sorted(missing_countries.tolist()),
+        )
+
+    # Use reindex instead of strict loc so countries without source data do not
+    # crash the workflow (e.g. MD/UA in some scenarios); they default to 0.
+    nodal_heating = existing_heating.reindex(pop_layout.ct).fillna(0.0)
     nodal_heating.index = pop_layout.index
     nodal_heating = nodal_heating.multiply(pop_layout.fraction, axis=0)
 

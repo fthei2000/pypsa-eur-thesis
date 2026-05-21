@@ -197,7 +197,7 @@ if CUTOUT_DATASET["source"] in ["build"]:
         params:
             cutouts=config_provider("atlite", "cutouts"),
         output:
-            cutout=CUTOUT_DATASET["folder"] / "{cutout}.nc",
+            cutout=CUTOUT_DATASET["folder"] + "/{cutout}.nc",
         log:
             "logs/build_cutout/{cutout}.log",
         benchmark:
@@ -831,6 +831,7 @@ rule prepare_network:
         co2limit=config_provider("electricity", "co2limit"),
         gaslimit_enable=config_provider("electricity", "gaslimit_enable", default=False),
         gaslimit=config_provider("electricity", "gaslimit"),
+        cost_year=config_provider("costs", "year"),
         emission_prices=config_provider("costs", "emission_prices"),
         adjustments=config_provider("adjustments", "electricity"),
         autarky=config_provider("electricity", "autarky", default={}),

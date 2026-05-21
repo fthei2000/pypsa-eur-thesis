@@ -862,13 +862,24 @@ sector:
   co2_sequestration_potential:
     2020: 0
     2025: 0
-    2030: 40
-    2035: 100
-    2040: 180
-    2045: 250
-    2050: 250
+    2030: 50
+    2035: 120
+    2040: 250
+    2045: 350
+    2050: 600
   co2_sequestration_cost: 30
+  co2_sequestration_cost_by_country: {}
+  co2_sequestration_cost_by_node: {}
   co2_sequestration_lifetime: 50
+  cdr_credit_price: 0.0
+  cdr_credit_scope: all_sequestration
+  cdr_credit_timing: capture
+  dac_variants:
+    enable: false
+    variants: {}
+  dac_weather_factors:
+    enable: false
+    file: data/dac_country_weather_factors.csv
   co2_spatial: true
   co2_network: true
   co2_network_cost_factor: 1
@@ -1078,7 +1089,7 @@ costs:
     CO2 intensity: 0
     discount rate: 0.07
     standing losses: 0
-  custom_cost_fn: data/custom_costs.csv
+  custom_cost_fn: data/costs/custom_costs_medium.csv
   overwrites: {}
   capital_cost: {}
   marginal_cost: {}

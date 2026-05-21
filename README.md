@@ -4,7 +4,7 @@ SPDX-License-Identifier: CC-BY-4.0
 -->
 
 > [!IMPORTANT]
-> **Master Thesis Fork — Felicia & Philipp, DTU, 2025–2026**
+> **Master Thesis Fork — Felicia & Philipp, DTU, 2026**
 >
 > This is a modified version of PyPSA-Eur used for our Master's thesis at the Technical University of Denmark (DTU). The model has been extended to investigate **Carbon Dioxide Removal (CDR)** technologies and their role in the European energy system transition.
 >

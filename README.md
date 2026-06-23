@@ -9,7 +9,7 @@ SPDX-License-Identifier: CC-BY-4.0
 > This is a modified version of PyPSA-Eur used for our Master's thesis at the Technical University of Denmark (DTU). The model has been extended to investigate **Carbon Dioxide Removal (CDR)** technologies and their role in the European energy system transition.
 >
 > Every thesis contribution is mapped to the exact code that implements it in
-> [`CONTRIBUTIONS.md`](CONTRIBUTIONS.md) — a code map separating our additions
+> [`CONTRIBUTIONS.md`](CONTRIBUTIONS.md) - a code map separating our additions
 > (CDR credit accounting, sequestration economics, DAC enhancements, and the
 > supply-curve results) from upstream PyPSA-Eur.
 >

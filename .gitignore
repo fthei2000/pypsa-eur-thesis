@@ -25,6 +25,7 @@ gurobi.log
 /logs
 /notebooks
 /data/*
+!/data/dac_country_weather_factors.csv
 !/data/costs/
 /data/costs/*
 !/data/costs/custom_costs_low_hoB.csv

@@ -2,7 +2,8 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 from matplotlib.patches import FancyBboxPatch, Polygon, FancyArrowPatch
 
-OUT_DIR = Path("/work3/s240459/pypsa-eur-thesis/notebooks")
+OUT_DIR = Path(__file__).resolve().parents[1] / "notebooks"
+OUT_DIR.mkdir(exist_ok=True)
 PNG = OUT_DIR / "cdr_market_gap_storyline.png"
 PDF = OUT_DIR / "cdr_market_gap_storyline.pdf"
 

@@ -103,6 +103,13 @@ CLAUDE.local.md
 /figures
 
 # Archived/superseded Thesis_Runs experiments — kept on disk, out of the handed-in tree.
+# Local thesis draft material and non-final robustness experiments — kept on disk, out of Git.
+/ThesisMds/
+/config/Thesis_Runs/Robustness_Analysis_NetZero/
+/jobs/gen_robustness_netzero.sh
+/jobs/run_robustness_netzero.sh
+/scripts/regenerate_cdr_accounting_waterfall.py
+
 # Canonical thesis scenarios are Scenario_1_Deployment_Response and
 # Robustness_Analysis_ETS only.
 /config/Thesis_Runs/00RunsToLearn/
